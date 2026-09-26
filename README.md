@@ -1,98 +1,209 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# MailOps
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Personal NestJS backend that automates role-based outreach emails, using a **Google Sheet as the
+only store** — no database.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+> Phase 1 status: sheet I/O + row validation + the nodemailer transport are in place.
+> Templates, batch sending, cron and follow-ups land in Phases 2–4 (`src/specs/plan.md`).
 
-## Description
+## Requirements
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+- Node.js 20+
+- A Google Sheet with the columns listed under [Sheet columns](#sheet-columns)
+- Either an Apps Script web app (no Google OAuth in this app) **or** a service account shared
+  with the sheet
 
-## Project setup
+## Setup
 
 ```bash
-$ npm install
+npm install
+cp .env.example .env   # then fill in the values below
+npm run start:dev
 ```
 
-## Compile and run the project
+The API is served under the `API_PREFIX` prefix (`http://localhost:3000/api` by default).
+
+## How the app reaches your Google Sheet
+
+Google's Sheets API has no unauthenticated mode, so "no OAuth in the app" is achieved by
+authorising **once** in the browser. Two interchangeable drivers are available; pick one with
+`GOOGLE_SHEET_DRIVER`.
+
+### 1. `apps_script` (default, recommended)
+
+An Apps Script web app runs *as you* and exposes a tiny JSON bridge, so the backend needs no
+Google credentials at all.
+
+1. Open the target sheet → **Extensions → Apps Script**.
+2. Replace the sample code with the contents of [`scripts/google-sheet.gs`](scripts/google-sheet.gs) and save.
+3. **Deploy → New deployment → Web app**
+   - Execute as: **Me**
+   - Who has access: **Anyone**
+4. Copy the Web app URL into `.env`:
+
+```env
+GOOGLE_SHEET_DRIVER=apps_script
+GOOGLE_APPS_SCRIPT_URL=https://script.google.com/macros/s/XXXX/exec
+```
+
+The script supports three actions: `meta` (tab names), `read` (rows as a 2-D array) and
+`update` (targeted `setValues` on an A1 range).
+
+### 2. `service_account`
+
+Authenticates as a service identity instead of a user. No OAuth flow, but the sheet must be
+shared with the service account as an **Editor**.
+
+1. Share the sheet with `GOOGLE_SERVICE_ACCOUNT_EMAIL`.
+2. Set the driver:
+
+```env
+GOOGLE_SHEET_DRIVER=service_account
+```
+
+The Apps Script web app is the only option that also works when the sheet stays completely
+private to you.
+
+## Sheet columns
+
+Row 1 is the header. Only `name`, `email`, `company` and `role` are required; the rest default
+sensibly and are written back by later phases. Header matching is case- and separator-insensitive
+(`Follow Up Days` == `follow_up_days`).
+
+| Column | Purpose |
+|---|---|
+| `name` | Recipient name — required |
+| `email` | Recipient email — required, must be a valid address |
+| `company` | Company name — required |
+| `role` | `FRONTEND` / `BACKEND` / `FULL_STACK` — required |
+| `status` | `PENDING` / `PROCESSING` / `SENT` / `FAILED` (defaults to `PENDING`) |
+| `sent_at` | Timestamp of a successful send |
+| `message_id` | Provider message id |
+| `error` | Failure reason |
+| `attempts` | Retry count |
+| `campaign_id` | Batch identifier, e.g. `campaign-20260927-001` |
+| `follow_up_enabled` | `YES` / `NO` (defaults to `NO`) |
+| `follow_up_days` | Days after `sent_at` to trigger the follow-up |
+| `follow_up_status` | `NOT_SCHEDULED` / `SCHEDULED` / `PROCESSING` / `SENT` / `FAILED` |
+| `follow_up_sent_at` | Timestamp of the follow-up send |
+| `follow_up_message_id` | Provider message id for the follow-up |
+| `processing_started_at` | Used to recover stale `PROCESSING` rows after a crash |
+
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /campaign/connect-sheet` | Register a spreadsheet URL/id for this process and verify it is reachable |
+| `GET /campaign/validate` | Validate every row and return counts plus row-level errors |
+| `POST /email/verify` | Check the SMTP/OAuth2 credentials before running a campaign |
+
+### Connect a sheet
 
 ```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+curl -X POST http://localhost:3000/api/campaign/connect-sheet \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1X8K4.../edit",
+    "sheetName": "Candidates"
+  }'
 ```
 
-## Run tests
+`spreadsheetUrl` accepts a full URL or a bare spreadsheet id. `sheetName` is optional and
+defaults to `SHEET_NAME`. There is no database in V1, so the connection lives for the lifetime of
+the process; `GOOGLE_SPREADSHEET_ID` + `SHEET_NAME` are used after a restart.
+
+### Validate rows
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+curl http://localhost:3000/api/campaign/validate
 ```
 
-## Deployment
+```json
+{
+  "connection": { "spreadsheetId": "1X8K4...", "sheetName": "Candidates", "driver": "apps_script" },
+  "total": 55,
+  "valid": 53,
+  "invalid": 2,
+  "errors": [
+    { "row": 12, "field": "email", "message": "email is not a valid email address" },
+    { "row": 31, "field": "role", "message": "role must be one of: FRONTEND, BACKEND, FULL_STACK" }
+  ]
+}
+```
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+`row` is the 1-based Google Sheets row number, so it lines up with the sheet you are looking at.
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+## Email
+
+Sending goes through the `EmailProvider` interface
+(`src/modules/email/providers/email.provider.ts`); Phase 1 ships the nodemailer implementation.
+The campaign layer never talks to nodemailer directly, so adding SES/Resend later is a new
+provider, not a rewrite.
+
+```env
+MAIL_SERVICE=gmail
+MAIL_HOST=smtp.gmail.com
+MAIL_PORT=587
+MAIL_SECURE=false
+MAIL_AUTH_TYPE=password     # or oauth2
+MAIL_FROM=you@gmail.com
+MAIL_USER=you@gmail.com
+MAIL_PASSWORD=<gmail app password>
+```
+
+For `MAIL_AUTH_TYPE=password` use a Gmail **App Password**
+(Google Account → Security → 2-Step Verification → App passwords). For `oauth2`, the transport
+reuses `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN` with the
+`sheets` + `gmail.send` scopes. Verify either with:
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+curl -X POST http://localhost:3000/api/email/verify
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+## Configuration
 
-## Resources
+All environment variables are read once in `src/config`; nothing else touches `process.env`.
 
-Check out a few resources that may come in handy when working with NestJS:
+| Variable | Default | Purpose |
+|---|---|---|
+| `NODE_ENV` | `development` | Runtime environment |
+| `PORT` | `3000` | HTTP port |
+| `API_PREFIX` | `api` | Route prefix |
+| `SHEET_NAME` | `Candidates` | Tab to operate on |
+| `GOOGLE_SHEET_DRIVER` | `apps_script` | `apps_script` or `service_account` |
+| `GOOGLE_APPS_SCRIPT_URL` | – | Deployed web app URL (apps_script driver) |
+| `GOOGLE_SHEET_TIMEOUT_MS` | `15000` | Sheet request timeout |
+| `GOOGLE_SPREADSHEET_ID` | – | Default spreadsheet |
+| `GOOGLE_SERVICE_ACCOUNT_EMAIL` / `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` | – | service_account driver |
+| `MAIL_*` | see above | Outgoing mail transport |
+| `EMAIL_DELAY_MS` | `2000` | Delay between sends (Phase 3) |
+| `EMAIL_MAX_RETRIES` | `2` | Retry cap (Phase 3) |
+| `STALE_PROCESSING_THRESHOLD_MINUTES` | `30` | Stale `PROCESSING` recovery (Phase 4) |
+| `CRON_*` | – | Daily schedule (Phase 4) |
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+## Project layout
 
-## Support
+```text
+src/
+├── common/filters/          # global HTTP exception filter
+├── config/                  # typed, centralised env configuration
+├── modules/
+│   ├── campaign/            # connect-sheet + validate endpoints
+│   ├── email/               # EmailProvider abstraction + nodemailer provider
+│   └── google-sheet/        # drivers, repository, service, Candidate entity
+└── specs/                   # PRD, plan, architecture
+scripts/google-sheet.gs      # Apps Script bridge to deploy
+```
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+Writes always target individual cells: patched columns are grouped into contiguous spans and
+written with `setValues`, so untouched cells in a row are never cleared.
 
-## Stay in touch
+## Scripts
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+```bash
+npm run start:dev   # watch mode
+npm run build       # compile
+npm run lint        # eslint --fix
+npm test            # unit tests
+npm run test:e2e    # e2e tests
+```
