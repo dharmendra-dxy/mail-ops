@@ -81,7 +81,7 @@ sensibly and are written back by later phases. Header matching is case- and sepa
 | `sent_at` | Timestamp of a successful send |
 | `message_id` | Provider message id |
 | `error` | Failure reason |
-| `attempts` | Retry count |
+| `attempts` | Attempts used; a row is skipped once it reaches `1 + EMAIL_MAX_RETRIES` |
 | `campaign_id` | Batch identifier, e.g. `campaign-20260927-001` |
 | `follow_up_enabled` | `YES` / `NO` (defaults to `NO`) |
 | `follow_up_days` | Days after `sent_at` to trigger the follow-up |
@@ -97,7 +97,8 @@ sensibly and are written back by later phases. Header matching is case- and sepa
 | `POST /campaign/connect-sheet` | Register a spreadsheet URL/id for this process and verify it is reachable |
 | `GET /campaign/validate` | Validate every row and return counts plus row-level errors |
 | `GET /campaign/preview` | Counts plus rendered subject/body per candidate — sends nothing |
-| `POST /campaign/send` | Dry run by default; `?dryRun=false` sends for real |
+| `GET /campaign/status` | Live counts by status, follow-up counts, and whether a run is in flight |
+| `POST /campaign/send` | Dry run by default; `?dryRun=false` starts a real background run |
 | `POST /email/verify` | Check the SMTP/OAuth2 credentials before running a campaign |
 
 ### Connect a sheet
@@ -146,6 +147,25 @@ Query params: `limit` (default 5, max 50), `role` (`FRONTEND`/`BACKEND`/`FULL_ST
 `type` (`initial`/`follow_up`). Returns counts, how many rows are eligible, and the
 rendered subject and body — read this before every real send.
 
+### Status
+
+```bash
+curl http://localhost:3000/api/campaign/status
+```
+
+```json
+{
+  "connection": { "spreadsheetId": "1X8K4...", "sheetName": "Candidates", "driver": "apps_script" },
+  "counts": { "total": 55, "pending": 3, "processing": 2, "sent": 48, "failed": 2 },
+  "followUp": { "notScheduled": 55, "scheduled": 0, "processing": 0, "sent": 0, "failed": 0, "enabled": 0 },
+  "running": true,
+  "activeCampaignId": "campaign-20260927-001"
+}
+```
+
+`counts` and `followUp` are read live from the sheet on every call. `running` is the
+single-run lock: while it is `true`, `POST /campaign/send` answers **409 Conflict**.
+
 ### Send
 
 ```bash
@@ -156,11 +176,26 @@ curl -X POST 'http://localhost:3000/api/campaign/send?limit=3'
 curl -X POST 'http://localhost:3000/api/campaign/send?dryRun=false&limit=1'
 ```
 
-A row is eligible when it passes validation **and** is still `PENDING`, so a second call
-never re-sends a batch. Sends are sequential with `EMAIL_DELAY_MS` between them, a
-failing row is recorded and the batch continues, and each outcome is written straight
-back to the sheet. An unrecognised `dryRun` value is rejected with 400 rather than being
-treated as `false`.
+A row is eligible when it passes validation and is still `PENDING` (or is a stale
+`PROCESSING` leftover), so a second call never re-sends a batch. An unrecognised
+`dryRun` value is rejected with 400 rather than being treated as `false`.
+
+A dry run answers immediately with the rendered emails. A real send answers
+`{"status":"STARTED","campaignId":"campaign-20260927-001","total":50}` and then runs in
+the background, because a 50-row batch takes about `50 × EMAIL_DELAY_MS`:
+
+```bash
+# watch it progress
+watch -n 5 'curl -s http://localhost:3000/api/campaign/status | jq .counts'
+```
+
+Each row walks `PENDING → PROCESSING → SENT | FAILED`, and `PROCESSING` is written
+*before* the provider is called, so a crash mid-batch leaves an auditable trail
+instead of a silently re-sent row. Retryable failures (timeouts, rate limits,
+network) are retried up to `EMAIL_MAX_RETRIES`; permanent ones (bad address, auth)
+fail immediately. Every outcome is written straight back to the sheet, one failing
+row never stops the batch, and every processed row is stamped with the
+`campaign_id` of the run that touched it.
 
 ## Email
 
@@ -216,8 +251,8 @@ All environment variables are read once in `src/config`; nothing else touches `p
 | `MAIL_*` | see above | Outgoing mail transport |
 | `SEND_DEFAULT_DRY_RUN` | `true` | Fallback for `POST /campaign/send` when `?dryRun` is absent |
 | `EMAIL_DELAY_MS` | `2000` | Delay between sends |
-| `EMAIL_MAX_RETRIES` | `2` | Retry cap (Phase 3) |
-| `STALE_PROCESSING_THRESHOLD_MINUTES` | `30` | Stale `PROCESSING` recovery (Phase 4) |
+| `EMAIL_MAX_RETRIES` | `2` | Retries per row for retryable failures, so 3 attempts in total |
+| `STALE_PROCESSING_THRESHOLD_MINUTES` | `30` | A `PROCESSING` row older than this is re-eligible |
 | `CRON_*` | – | Daily schedule (Phase 4) |
 
 ## Project layout
@@ -227,7 +262,7 @@ src/
 ├── common/filters/          # global HTTP exception filter
 ├── config/                  # typed, centralised env configuration
 ├── modules/
-│   ├── campaign/            # connect-sheet, validate, preview, send
+│   ├── campaign/            # connect-sheet, validate, preview, status, send
 │   ├── email/               # EmailProvider abstraction + nodemailer provider
 │   ├── google-sheet/        # drivers, repository, service, Candidate entity
 │   └── template/            # per-role email copy + Handlebars rendering

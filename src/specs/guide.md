@@ -6,6 +6,11 @@ Companion to `prd.md` (what the product should be), `plan.md` (the phases) and
 
 **Status: Phase 1 and Phase 2 complete. Phase 3+ not started.**
 
+> This guide describes the state of the project after Phase 2. **Phase 3 is now
+> implemented** — see [`guide-2.md`](./guide-2.md) for the campaign state machine,
+> the single-run lock, retries and `GET /campaign/status`. Section 9 below is
+> superseded by it.
+
 ---
 
 ## 1. Where the project stands

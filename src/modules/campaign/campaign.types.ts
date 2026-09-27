@@ -1,4 +1,5 @@
 import { CandidateRowError, SheetConnection } from '../google-sheet';
+import { CAMPAIGN_RUN_STATUS } from './campaign.constant';
 
 export interface SheetValidationReport {
   connection: SheetConnection;
@@ -53,12 +54,52 @@ export interface SendResultRow {
   error?: string;
 }
 
+/**
+ * Dry runs finish inline — rendering is fast and the caller needs the rendered
+ * emails back — so the full result set is returned in the response.
+ */
 export interface CampaignSendResponse {
   connection: SheetConnection;
-  dryRun: boolean;
+  status: typeof CAMPAIGN_RUN_STATUS.DRY_RUN_COMPLETED;
+  campaignId: string;
+  dryRun: true;
   eligible: number;
   processed: number;
   sent: number;
   failed: number;
   results: SendResultRow[];
+}
+
+/**
+ * A real send is handed to a background run and answers immediately, because a
+ * 60-row batch takes roughly `limit * EMAIL_DELAY_MS` to finish. Progress is
+ * observable through `GET /campaign/status` and the sheet itself.
+ */
+export interface CampaignStartResponse {
+  connection: SheetConnection;
+  status: typeof CAMPAIGN_RUN_STATUS.STARTED;
+  campaignId: string;
+  dryRun: false;
+  total: number;
+}
+
+export type CampaignRunResponse = CampaignSendResponse | CampaignStartResponse;
+
+/** Follow-up columns are only aggregated here; Phase 4 acts on them. */
+export interface FollowUpCounts {
+  notScheduled: number;
+  scheduled: number;
+  processing: number;
+  sent: number;
+  failed: number;
+  enabled: number;
+}
+
+export interface CampaignStatusResponse {
+  connection: SheetConnection;
+  counts: CampaignCounts;
+  followUp: FollowUpCounts;
+  /** True while a background run holds the single-run lock. */
+  running: boolean;
+  activeCampaignId: string | null;
 }

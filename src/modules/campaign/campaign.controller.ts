@@ -9,8 +9,9 @@ import {
 } from '@nestjs/common';
 import { CampaignService } from './campaign.service';
 import {
+  CampaignRunResponse,
   CampaignPreviewResponse,
-  CampaignSendResponse,
+  CampaignStatusResponse,
   ConnectSheetResponse,
   SheetValidationReport,
 } from './campaign.types';
@@ -42,12 +43,23 @@ export class CampaignController {
   }
 
   /**
+   * Live counts by status, plus whether a campaign currently holds the
+   * single-run lock. Read this to watch a background run from Phase 3.
+   */
+  @Get('status')
+  status(): Promise<CampaignStatusResponse> {
+    return this.campaignService.getStatus();
+  }
+
+  /**
    * Dry-run unless `?dryRun=false` is passed explicitly, which is what
-   * SEND_DEFAULT_DRY_RUN controls.
+   * SEND_DEFAULT_DRY_RUN controls. A dry run answers with the rendered emails;
+   * a real send answers `STARTED` immediately and runs in the background.
+   * A second concurrent run is rejected with 409.
    */
   @Post('send')
   @HttpCode(HttpStatus.OK)
-  send(@Query() dto: SendCampaignDto): Promise<CampaignSendResponse> {
+  send(@Query() dto: SendCampaignDto): Promise<CampaignRunResponse> {
     return this.campaignService.send(dto);
   }
 }

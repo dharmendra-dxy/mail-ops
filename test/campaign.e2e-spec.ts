@@ -90,6 +90,25 @@ describe('Campaign endpoints (e2e)', () => {
     await app.close();
   });
 
+  /** Polls a condition over HTTP so timing never decides an assertion. */
+  const waitUntil = async (
+    condition: () => Promise<boolean>,
+  ): Promise<void> => {
+    for (let tick = 0; tick < 200; tick += 1) {
+      if (await condition()) return;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    throw new Error('condition was never met');
+  };
+
+  /** Reads the single-run lock the same way an operator would. */
+  const runningFlag = async (): Promise<boolean> => {
+    const response = await request(app.getHttpServer()).get(
+      '/api/campaign/status',
+    );
+    return (response.body as { running: boolean }).running;
+  };
+
   it('POST /api/campaign/connect-sheet registers the spreadsheet', async () => {
     const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/edit`;
 
@@ -250,12 +269,24 @@ describe('Campaign endpoints (e2e)', () => {
       emailService.send.mockClear();
     });
 
+    /** A real send is answered before the batch finishes. */
+    const waitForIdleRun = async (): Promise<void> => {
+      await waitUntil(async () => !(await runningFlag()));
+    };
+
     it('is a dry run by default', async () => {
       const response = await request(app.getHttpServer())
         .post('/api/campaign/send')
         .expect(200);
 
-      expect((response.body as { dryRun: boolean }).dryRun).toBe(true);
+      const body = response.body as {
+        status: string;
+        dryRun: boolean;
+        results: Array<{ status: string }>;
+      };
+      expect(body.dryRun).toBe(true);
+      expect(body.status).toBe('DRY_RUN_COMPLETED');
+      expect(body.results[0].status).toBe('DRY_RUN');
       expect(emailService.send).not.toHaveBeenCalled();
       expect(googleSheetService.updateRow).not.toHaveBeenCalled();
     });
@@ -269,22 +300,30 @@ describe('Campaign endpoints (e2e)', () => {
       expect(emailService.send).not.toHaveBeenCalled();
     });
 
-    it('sends and writes state back when dryRun=false', async () => {
+    it('answers STARTED and writes state back when dryRun=false', async () => {
       const response = await request(app.getHttpServer())
         .post('/api/campaign/send?dryRun=false')
         .expect(200);
 
       const body = response.body as {
-        sent: number;
-        results: Array<{ status: string; messageId: string }>;
+        status: string;
+        campaignId: string;
+        total: number;
       };
-      expect(body.sent).toBe(1);
-      expect(body.results[0]).toMatchObject({
-        status: 'SENT',
-        messageId: 'msg-1',
-      });
+      expect(body.status).toBe('STARTED');
+      expect(body.total).toBe(1);
+      expect(body.campaignId).toMatch(/^campaign-\d{8}-\d{3}$/);
+
+      await waitForIdleRun();
+
       expect(emailService.send).toHaveBeenCalledTimes(1);
-      expect(googleSheetService.updateRow).toHaveBeenCalledWith(
+      expect(googleSheetService.updateRow).toHaveBeenNthCalledWith(
+        1,
+        2,
+        expect.objectContaining({ status: 'PROCESSING' }),
+      );
+      expect(googleSheetService.updateRow).toHaveBeenNthCalledWith(
+        2,
         2,
         expect.objectContaining({ status: 'SENT', message_id: 'msg-1' }),
       );
@@ -295,5 +334,75 @@ describe('Campaign endpoints (e2e)', () => {
         .post('/api/campaign/send?dryRun=maybe')
         .expect(400);
     });
+  });
+
+  describe('GET /api/campaign/status', () => {
+    beforeEach(() => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+        buildCandidate({ rowNumber: 3, status: 'SENT' }),
+        buildCandidate({
+          rowNumber: 4,
+          status: 'FAILED',
+          followUpEnabled: 'YES',
+        }),
+      ]);
+    });
+
+    it('returns live counts, follow-up counts and the run state', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/api/campaign/status')
+        .expect(200);
+
+      expect(response.body as unknown).toEqual({
+        connection: CONNECTION,
+        counts: {
+          total: 3,
+          pending: 1,
+          processing: 0,
+          sent: 1,
+          failed: 1,
+        },
+        followUp: {
+          notScheduled: 3,
+          scheduled: 0,
+          processing: 0,
+          sent: 0,
+          failed: 0,
+          enabled: 1,
+        },
+        running: false,
+        activeCampaignId: null,
+      });
+    });
+  });
+
+  it('POST /api/campaign/send answers 409 while a run is in flight', async () => {
+    let release!: (value: { messageId: string }) => void;
+    emailService.send.mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    googleSheetService.getCandidates.mockResolvedValue([
+      buildCandidate({ rowNumber: 2 }),
+    ]);
+
+    let firstStatus = 0;
+    const first = request(app.getHttpServer())
+      .post('/api/campaign/send?dryRun=false')
+      .then((response) => {
+        firstStatus = response.status;
+      });
+
+    await waitUntil(runningFlag);
+
+    await request(app.getHttpServer())
+      .post('/api/campaign/send?dryRun=false')
+      .expect(409);
+
+    release({ messageId: 'msg-1' });
+    await first;
+    expect(firstStatus).toBe(200);
   });
 });

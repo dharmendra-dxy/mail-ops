@@ -1,9 +1,15 @@
 import { ConfigService } from '@nestjs/config';
+import { ConflictException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { EmailService } from '../email';
 import { Candidate, GoogleSheetService, SHEET_COLUMNS } from '../google-sheet';
 import { TemplateService } from '../template';
 import { CampaignService } from './campaign.service';
+import {
+  CampaignSendResponse,
+  CampaignStartResponse,
+  CampaignStatusResponse,
+} from './campaign.types';
 import { PreviewCandidatesDto } from './dto/preview-candidates.dto';
 import { SendCampaignDto } from './dto/send-campaign.dto';
 
@@ -12,6 +18,8 @@ const CONNECTION = {
   sheetName: 'Candidates',
   driver: 'apps_script',
 };
+
+const MINUTE_MS = 60_000;
 
 function buildCandidate(overrides: Partial<Candidate>): Candidate {
   const candidate = new Candidate();
@@ -73,6 +81,65 @@ describe('CampaignService', () => {
     return module.get(CampaignService);
   };
 
+  /**
+   * A real send continues after the HTTP response, so tests wait for the lock to
+   * be released rather than for the request to return.
+   */
+  const waitForIdle = async (): Promise<void> => {
+    for (let tick = 0; tick < 200; tick += 1) {
+      if (!(await service.getStatus()).running) return;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    throw new Error('campaign run did not finish');
+  };
+
+  /** Lets a test hold a run open instead of racing a timer. */
+  const deferred = (): {
+    promise: Promise<{ messageId: string }>;
+    resolve: (value: { messageId: string }) => void;
+  } => {
+    let resolve!: (value: { messageId: string }) => void;
+    const promise = new Promise<{ messageId: string }>((inner) => {
+      resolve = inner;
+    });
+
+    return { promise, resolve };
+  };
+
+  const startRealSend = async (
+    overrides: Partial<SendCampaignDto> = {},
+  ): Promise<CampaignStartResponse> => {
+    const response = (await service.send(
+      Object.assign(new SendCampaignDto(), { dryRun: false, ...overrides }),
+    )) as CampaignStartResponse;
+    await waitForIdle();
+
+    return response;
+  };
+
+  const dryRun = async (
+    overrides: Partial<SendCampaignDto> = {},
+  ): Promise<CampaignSendResponse> =>
+    (await service.send(
+      Object.assign(new SendCampaignDto(), { dryRun: true, ...overrides }),
+    )) as CampaignSendResponse;
+
+  const patchOf = (call: number): Record<string, unknown> =>
+    (
+      googleSheetService.updateRow.mock.calls[call] as unknown as [
+        number,
+        Record<string, unknown>,
+      ]
+    )[1];
+
+  const rowOf = (call: number): number =>
+    (
+      googleSheetService.updateRow.mock.calls[call] as unknown as [
+        number,
+        Record<string, unknown>,
+      ]
+    )[0];
+
   beforeEach(async () => {
     googleSheetService = {
       getConnection: jest.fn().mockReturnValue(CONNECTION),
@@ -84,6 +151,8 @@ describe('CampaignService', () => {
     configValues = {
       'campaign.emailDelayMs': 0,
       'campaign.sendDefaultDryRun': true,
+      'campaign.emailMaxRetries': 2,
+      'campaign.staleProcessingThresholdMinutes': 30,
     };
 
     service = await buildService();
@@ -228,7 +297,44 @@ describe('CampaignService', () => {
     });
   });
 
-  describe('send', () => {
+  describe('getStatus', () => {
+    it('aggregates initial and follow-up counts from the live sheet', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+        buildCandidate({ rowNumber: 3, status: 'PROCESSING' }),
+        buildCandidate({ rowNumber: 4, status: 'SENT' }),
+        buildCandidate({ rowNumber: 5, status: 'FAILED' }),
+        buildCandidate({
+          rowNumber: 6,
+          followUpEnabled: 'YES',
+          followUpStatus: 'SCHEDULED',
+        }),
+        buildCandidate({ rowNumber: 7, followUpStatus: 'SENT' }),
+      ]);
+
+      const status: CampaignStatusResponse = await service.getStatus();
+
+      expect(status.counts).toEqual({
+        total: 6,
+        pending: 3,
+        processing: 1,
+        sent: 1,
+        failed: 1,
+      });
+      expect(status.followUp).toEqual({
+        notScheduled: 4,
+        scheduled: 1,
+        processing: 0,
+        sent: 1,
+        failed: 0,
+        enabled: 1,
+      });
+      expect(status.running).toBe(false);
+      expect(status.activeCampaignId).toBeNull();
+    });
+  });
+
+  describe('send (dry run)', () => {
     beforeEach(() => {
       googleSheetService.getCandidates.mockResolvedValue([
         buildCandidate({ rowNumber: 2 }),
@@ -241,9 +347,13 @@ describe('CampaignService', () => {
     });
 
     it('dry-runs by default: renders, never calls the provider, never writes', async () => {
-      const response = await service.send(new SendCampaignDto());
+      const response = (await service.send(
+        new SendCampaignDto(),
+      )) as CampaignSendResponse;
 
+      expect(response.status).toBe('DRY_RUN_COMPLETED');
       expect(response.dryRun).toBe(true);
+      expect(response.campaignId).toMatch(/^campaign-\d{8}-dry$/);
       expect(response.processed).toBe(2);
       expect(response.sent).toBe(0);
       expect(response.failed).toBe(0);
@@ -258,80 +368,27 @@ describe('CampaignService', () => {
       expect(googleSheetService.updateRow).not.toHaveBeenCalled();
     });
 
-    it('respects SEND_DEFAULT_DRY_RUN when no dryRun param is given', async () => {
-      configValues['campaign.sendDefaultDryRun'] = false;
+    it('never consumes a campaign sequence number', async () => {
       emailService.send.mockResolvedValue({ messageId: 'msg-1' });
 
-      const response = await service.send(new SendCampaignDto());
+      await dryRun();
 
-      expect(response.dryRun).toBe(false);
-      expect(emailService.send).toHaveBeenCalledTimes(2);
+      const started = await startRealSend({ limit: 1 });
+
+      expect(started.campaignId).toMatch(/^campaign-\d{8}-001$/);
     });
 
-    it('sends for real and writes SENT state per row', async () => {
-      emailService.send
-        .mockResolvedValueOnce({ messageId: 'msg-1' })
-        .mockResolvedValueOnce({ messageId: 'msg-2' });
+    it('releases the run lock so the next send is accepted', async () => {
+      emailService.send.mockResolvedValue({ messageId: 'msg-1' });
 
-      const response = await service.send(
-        Object.assign(new SendCampaignDto(), { dryRun: false }),
-      );
+      await dryRun();
 
-      expect(response.sent).toBe(2);
-      expect(response.failed).toBe(0);
-      expect(emailService.send).toHaveBeenNthCalledWith(
-        1,
-        expect.objectContaining({
-          to: 'asha@example.com',
-          subject: 'Frontend role at Acme — quick question',
-        }),
-      );
-      expect(googleSheetService.updateRow).toHaveBeenNthCalledWith(
-        1,
-        2,
-        expect.objectContaining({
-          [SHEET_COLUMNS.STATUS]: 'SENT',
-          [SHEET_COLUMNS.MESSAGE_ID]: 'msg-1',
-          [SHEET_COLUMNS.ATTEMPTS]: 1,
-          [SHEET_COLUMNS.ERROR]: '',
-        }),
-      );
-      const [firstRow, firstPatch] = googleSheetService.updateRow.mock
-        .calls[0] as [number, Record<string, unknown>];
-      expect(firstRow).toBe(2);
-      expect(firstPatch[SHEET_COLUMNS.SENT_AT]).toEqual(expect.any(String));
-    });
+      const status = await service.getStatus();
 
-    it('records FAILED for one row and keeps sending the rest', async () => {
-      emailService.send
-        .mockResolvedValueOnce({ messageId: 'msg-1' })
-        .mockRejectedValueOnce(new Error('550 mailbox unavailable'));
-
-      const response = await service.send(
-        Object.assign(new SendCampaignDto(), { dryRun: false }),
-      );
-
-      expect(response.sent).toBe(1);
-      expect(response.failed).toBe(1);
-      expect(response.results[1]).toMatchObject({
-        row: 3,
-        status: 'FAILED',
-        error: '550 mailbox unavailable',
+      expect(status.running).toBe(false);
+      await expect(startRealSend({ limit: 1 })).resolves.toMatchObject({
+        status: 'STARTED',
       });
-      expect(googleSheetService.updateRow).toHaveBeenNthCalledWith(
-        2,
-        3,
-        expect.objectContaining({
-          [SHEET_COLUMNS.STATUS]: 'FAILED',
-          [SHEET_COLUMNS.ERROR]: '550 mailbox unavailable',
-          [SHEET_COLUMNS.ATTEMPTS]: 1,
-        }),
-      );
-    });
-
-    it('defaults to a full batch of 50 rows', () => {
-      expect(new SendCampaignDto().limit).toBe(50);
-      expect(new PreviewCandidatesDto().limit).toBe(5);
     });
 
     it('warns when the limit leaves eligible rows unprocessed', async () => {
@@ -345,9 +402,7 @@ describe('CampaignService', () => {
         'warn',
       );
 
-      const response = await service.send(
-        Object.assign(new SendCampaignDto(), { limit: 2 }),
-      );
+      const response = await dryRun({ limit: 2 });
 
       expect(response.eligible).toBe(3);
       expect(response.processed).toBe(2);
@@ -357,18 +412,191 @@ describe('CampaignService', () => {
       warn.mockRestore();
     });
 
-    it('sends at most `limit` rows', async () => {
+    it('defaults to a full batch of 50 rows', () => {
+      expect(new SendCampaignDto().limit).toBe(50);
+      expect(new PreviewCandidatesDto().limit).toBe(5);
+    });
+  });
+
+  describe('send (real run)', () => {
+    beforeEach(() => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+        buildCandidate({
+          rowNumber: 3,
+          email: 'vikram@globex.com',
+          role: 'BACKEND',
+        }),
+      ]);
+    });
+
+    it('answers STARTED immediately with the batch size and campaign id', async () => {
       emailService.send.mockResolvedValue({ messageId: 'msg-1' });
 
       const response = await service.send(
-        Object.assign(new SendCampaignDto(), { dryRun: false, limit: 1 }),
+        Object.assign(new SendCampaignDto(), { dryRun: false }),
+      );
+      const started = response as CampaignStartResponse;
+
+      expect(started.status).toBe('STARTED');
+      expect(started.dryRun).toBe(false);
+      expect(started.total).toBe(2);
+      expect(started.campaignId).toMatch(/^campaign-\d{8}-001$/);
+      expect(started.connection).toEqual(CONNECTION);
+
+      await waitForIdle();
+    });
+
+    it('drives each row through PROCESSING then SENT', async () => {
+      emailService.send
+        .mockResolvedValueOnce({ messageId: 'msg-1' })
+        .mockResolvedValueOnce({ messageId: 'msg-2' });
+
+      const started = await startRealSend();
+
+      // Two writes per row: the PROCESSING lock, then the settled outcome.
+      expect(googleSheetService.updateRow).toHaveBeenCalledTimes(4);
+
+      expect(rowOf(0)).toBe(2);
+      expect(patchOf(0)).toMatchObject({
+        [SHEET_COLUMNS.STATUS]: 'PROCESSING',
+        [SHEET_COLUMNS.CAMPAIGN_ID]: started.campaignId,
+      });
+      expect(patchOf(0)[SHEET_COLUMNS.PROCESSING_STARTED_AT]).toEqual(
+        expect.any(String),
       );
 
-      expect(response.processed).toBe(1);
+      expect(rowOf(1)).toBe(2);
+      expect(patchOf(1)).toMatchObject({
+        [SHEET_COLUMNS.STATUS]: 'SENT',
+        [SHEET_COLUMNS.MESSAGE_ID]: 'msg-1',
+        [SHEET_COLUMNS.ERROR]: '',
+        [SHEET_COLUMNS.ATTEMPTS]: 1,
+      });
+      expect(patchOf(1)[SHEET_COLUMNS.SENT_AT]).toEqual(expect.any(String));
+
+      expect(rowOf(2)).toBe(3);
+      expect(patchOf(2)).toMatchObject({
+        [SHEET_COLUMNS.STATUS]: 'PROCESSING',
+        [SHEET_COLUMNS.CAMPAIGN_ID]: started.campaignId,
+      });
+      expect(patchOf(3)).toMatchObject({
+        [SHEET_COLUMNS.STATUS]: 'SENT',
+        [SHEET_COLUMNS.MESSAGE_ID]: 'msg-2',
+      });
+
+      expect(emailService.send).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          to: 'asha@example.com',
+          subject: 'Frontend role at Acme — quick question',
+        }),
+      );
+    });
+
+    it('stamps campaign_id on FAILED rows too', async () => {
+      emailService.send.mockRejectedValue(new Error('550 mailbox unavailable'));
+
+      const started = await startRealSend();
+
+      const failedPatches = googleSheetService.updateRow.mock.calls
+        .map(
+          (call) => (call as unknown as [number, Record<string, unknown>])[1],
+        )
+        .filter(
+          (patch) =>
+            patch[SHEET_COLUMNS.STATUS] === 'FAILED' &&
+            patch[SHEET_COLUMNS.CAMPAIGN_ID] !== undefined,
+        );
+
+      expect(failedPatches).toHaveLength(2);
+      expect(failedPatches[0][SHEET_COLUMNS.CAMPAIGN_ID]).toBe(
+        started.campaignId,
+      );
+    });
+
+    it('never re-sends a row that is already SENT', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+        buildCandidate({ rowNumber: 3, status: 'SENT' }),
+        buildCandidate({ rowNumber: 4, status: 'FAILED' }),
+      ]);
+      emailService.send.mockResolvedValue({ messageId: 'msg-1' });
+
+      const started = await startRealSend();
+
+      expect(started.total).toBe(1);
       expect(emailService.send).toHaveBeenCalledTimes(1);
     });
 
-    it('reports the full eligible count when a limit truncates the batch', async () => {
+    it('rejects a concurrent run with 409 Conflict', async () => {
+      // Holding the provider open keeps the first run in flight.
+      const gate = deferred();
+      emailService.send.mockReturnValue(gate.promise);
+
+      const first = service.send(
+        Object.assign(new SendCampaignDto(), { dryRun: false }),
+      );
+
+      const conflict = await service
+        .send(Object.assign(new SendCampaignDto(), { dryRun: false }))
+        .catch((error: ConflictException) => error);
+
+      expect(conflict).toBeInstanceOf(ConflictException);
+      expect((conflict as ConflictException).getStatus()).toBe(409);
+      expect((conflict as ConflictException).message).toContain(
+        'already running',
+      );
+
+      gate.resolve({ messageId: 'msg-1' });
+      await first;
+      await waitForIdle();
+    });
+
+    it('rejects a dry run while a real run is in flight', async () => {
+      const gate = deferred();
+      emailService.send.mockReturnValue(gate.promise);
+
+      const first = service.send(
+        Object.assign(new SendCampaignDto(), { dryRun: false }),
+      );
+
+      await expect(service.send(new SendCampaignDto())).rejects.toMatchObject({
+        status: 409,
+      });
+
+      gate.resolve({ messageId: 'msg-1' });
+      await first;
+      await waitForIdle();
+    });
+
+    it('continues past a failing row and waits EMAIL_DELAY_MS between sends', async () => {
+      configValues['campaign.emailDelayMs'] = 7;
+      emailService.send
+        .mockResolvedValueOnce({ messageId: 'msg-1' })
+        .mockRejectedValueOnce(new Error('450 mailbox busy'));
+      const spy = jest.spyOn(global, 'setTimeout');
+
+      const response = (await service.send(
+        Object.assign(new SendCampaignDto(), { dryRun: false }),
+      )) as CampaignStartResponse;
+      await waitForIdle();
+
+      expect(response.status).toBe('STARTED');
+      expect(emailService.send).toHaveBeenCalledTimes(2);
+      const statuses = googleSheetService.updateRow.mock.calls.map(
+        (call) =>
+          (call as unknown as [number, Record<string, unknown>])[1][
+            SHEET_COLUMNS.STATUS
+          ],
+      );
+      expect(statuses).toEqual(['PROCESSING', 'SENT', 'PROCESSING', 'FAILED']);
+      // Two sends means exactly one gap, never one after the final email.
+      expect(spy.mock.calls.filter(([, ms]) => ms === 7)).toHaveLength(1);
+      spy.mockRestore();
+    });
+
+    it('sends at most `limit` rows and reports the full eligible count', async () => {
       googleSheetService.getCandidates.mockResolvedValue(
         Array.from({ length: 3 }, (_unused, index) =>
           buildCandidate({ rowNumber: index + 2 }),
@@ -376,25 +604,216 @@ describe('CampaignService', () => {
       );
       emailService.send.mockResolvedValue({ messageId: 'msg-1' });
 
-      const response = await service.send(
-        Object.assign(new SendCampaignDto(), { dryRun: false, limit: 2 }),
-      );
+      const started = await startRealSend({ limit: 2 });
 
-      expect(response.eligible).toBe(3);
-      expect(response.processed).toBe(2);
+      expect(started.total).toBe(2);
+      expect(emailService.send).toHaveBeenCalledTimes(2);
     });
 
-    it('does not wait between sends when the delay is zero', async () => {
-      const spy = jest.spyOn(global, 'setTimeout');
+    it('numbers a second campaign after the ids already on the sheet', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({
+          rowNumber: 2,
+          status: 'SENT',
+          campaignId: 'campaign-20260101-009',
+        }),
+      ]);
       emailService.send.mockResolvedValue({ messageId: 'msg-1' });
 
-      await service.send(
-        Object.assign(new SendCampaignDto(), { dryRun: false }),
+      await startRealSend();
+
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({
+          rowNumber: 2,
+          status: 'SENT',
+          campaignId: `campaign-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-004`,
+        }),
+        buildCandidate({ rowNumber: 3 }),
+      ]);
+
+      const second = await startRealSend();
+
+      expect(second.campaignId).toMatch(/-005$/);
+    });
+  });
+
+  describe('error handling and retries', () => {
+    beforeEach(() => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+      ]);
+    });
+
+    it('retries a retryable failure and succeeds within the budget', async () => {
+      emailService.send
+        .mockRejectedValueOnce(new Error('ETIMEDOUT connection timed out'))
+        .mockResolvedValueOnce({ messageId: 'msg-1' });
+
+      await startRealSend();
+
+      expect(emailService.send).toHaveBeenCalledTimes(2);
+      const patches = googleSheetService.updateRow.mock.calls.map(
+        (call) => (call as unknown as [number, Record<string, unknown>])[1],
+      );
+      expect(patches[patches.length - 1]).toMatchObject({
+        [SHEET_COLUMNS.STATUS]: 'SENT',
+        [SHEET_COLUMNS.ATTEMPTS]: 2,
+      });
+    });
+
+    it('does not retry a permanent failure', async () => {
+      emailService.send.mockRejectedValue(
+        new Error(
+          '550 5.1.1 The email account that you tried to reach does not exist',
+        ),
       );
 
-      // Two sends means exactly one gap, never one after the final email.
-      expect(spy).toHaveBeenCalledTimes(1);
-      spy.mockRestore();
+      await startRealSend();
+
+      expect(emailService.send).toHaveBeenCalledTimes(1);
+      expect(
+        patchOf(googleSheetService.updateRow.mock.calls.length - 1),
+      ).toMatchObject({
+        [SHEET_COLUMNS.STATUS]: 'FAILED',
+        [SHEET_COLUMNS.ATTEMPTS]: 1,
+      });
+    });
+
+    it('gives up after EMAIL_MAX_RETRIES and records the last reason', async () => {
+      emailService.send.mockRejectedValue(new Error('503 service unavailable'));
+
+      await startRealSend();
+
+      // 1 initial attempt + 2 retries.
+      expect(emailService.send).toHaveBeenCalledTimes(3);
+      const last = googleSheetService.updateRow.mock.calls.at(
+        -1,
+      ) as unknown as [number, Record<string, unknown>];
+      expect(last[1]).toMatchObject({
+        [SHEET_COLUMNS.STATUS]: 'FAILED',
+        [SHEET_COLUMNS.ERROR]: '503 service unavailable',
+        [SHEET_COLUMNS.ATTEMPTS]: 3,
+      });
+      expect(last[1][SHEET_COLUMNS.CAMPAIGN_ID]).toEqual(expect.any(String));
+    });
+
+    it('skips a PENDING row that already used its whole attempt budget', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2, attempts: 3 }),
+      ]);
+      const warn = jest.spyOn(
+        (service as unknown as { logger: { warn: jest.Mock } }).logger,
+        'warn',
+      );
+
+      const started = await startRealSend();
+
+      expect(started.total).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('already used all 3 attempts'),
+      );
+      warn.mockRestore();
+    });
+
+    it('marks a row FAILED without PROCESSING when the template cannot render', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2, role: 'DESIGNER' }),
+      ]);
+      const started = await startRealSend();
+
+      expect(started.total).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+    });
+
+    it('never re-sends when the settle write after a successful send fails', async () => {
+      emailService.send.mockResolvedValue({ messageId: 'msg-1' });
+      googleSheetService.updateRow.mockImplementation(
+        (row: number, patch: Record<string, unknown>) => {
+          if (patch[SHEET_COLUMNS.STATUS] === 'SENT') {
+            return Promise.reject(new Error('sheet unreachable'));
+          }
+          return Promise.resolve(1);
+        },
+      );
+
+      await startRealSend();
+
+      // One delivery, one aborted run: a lost state write must not become a
+      // second email.
+      expect(emailService.send).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('stale PROCESSING recovery', () => {
+    it('re-sends a row stuck in PROCESSING past the threshold', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({
+          rowNumber: 2,
+          status: 'PROCESSING',
+          processingStartedAt: new Date(
+            Date.now() - 45 * MINUTE_MS,
+          ).toISOString(),
+        }),
+      ]);
+      emailService.send.mockResolvedValue({ messageId: 'msg-1' });
+      const warn = jest.spyOn(
+        (service as unknown as { logger: { warn: jest.Mock } }).logger,
+        'warn',
+      );
+
+      const started = await startRealSend();
+
+      expect(started.total).toBe(1);
+      expect(emailService.send).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('stale PROCESSING row(s): 2'),
+      );
+      warn.mockRestore();
+    });
+
+    it('leaves a row in PROCESSING alone while it is still inside the threshold', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({
+          rowNumber: 2,
+          status: 'PROCESSING',
+          processingStartedAt: new Date(
+            Date.now() - 2 * MINUTE_MS,
+          ).toISOString(),
+        }),
+      ]);
+
+      const started = await startRealSend();
+
+      expect(started.total).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+    });
+
+    it('recovers a PROCESSING row with no timestamp at all', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2, status: 'PROCESSING' }),
+      ]);
+      emailService.send.mockResolvedValue({ messageId: 'msg-1' });
+
+      const started = await startRealSend();
+
+      expect(started.total).toBe(1);
+    });
+  });
+
+  it('releases the run lock when a campaign is aborted', async () => {
+    googleSheetService.getCandidates.mockResolvedValue([
+      buildCandidate({ rowNumber: 2 }),
+    ]);
+    googleSheetService.updateRow.mockRejectedValue(
+      new Error('sheet unreachable'),
+    );
+
+    await startRealSend();
+
+    await expect(service.getStatus()).resolves.toMatchObject({
+      running: false,
+      activeCampaignId: null,
     });
   });
 
