@@ -3,8 +3,9 @@
 Personal NestJS backend that automates role-based outreach emails, using a **Google Sheet as the
 only store** — no database.
 
-> Phase 1 status: sheet I/O + row validation + the nodemailer transport are in place.
-> Templates, batch sending, cron and follow-ups land in Phases 2–4 (`src/specs/plan.md`).
+> **Status: Phase 1 and Phase 2 complete.** Sheet I/O, validation, role templates, dry-run and
+> real sending are working. Campaign orchestration, cron and follow-ups land in Phases 3–4.
+> See [`src/specs/guide.md`](src/specs/guide.md) for the full development guide.
 
 ## Requirements
 
@@ -95,6 +96,8 @@ sensibly and are written back by later phases. Header matching is case- and sepa
 |---|---|
 | `POST /campaign/connect-sheet` | Register a spreadsheet URL/id for this process and verify it is reachable |
 | `GET /campaign/validate` | Validate every row and return counts plus row-level errors |
+| `GET /campaign/preview` | Counts plus rendered subject/body per candidate — sends nothing |
+| `POST /campaign/send` | Dry run by default; `?dryRun=false` sends for real |
 | `POST /email/verify` | Check the SMTP/OAuth2 credentials before running a campaign |
 
 ### Connect a sheet
@@ -133,12 +136,47 @@ curl http://localhost:3000/api/campaign/validate
 
 `row` is the 1-based Google Sheets row number, so it lines up with the sheet you are looking at.
 
+### Preview rendered emails
+
+```bash
+curl 'http://localhost:3000/api/campaign/preview?limit=2&role=FRONTEND'
+```
+
+Query params: `limit` (default 5, max 50), `role` (`FRONTEND`/`BACKEND`/`FULL_STACK`),
+`type` (`initial`/`follow_up`). Returns counts, how many rows are eligible, and the
+rendered subject and body — read this before every real send.
+
+### Send
+
+```bash
+# Dry run (the default): renders everything, no provider call, no sheet write
+curl -X POST 'http://localhost:3000/api/campaign/send?limit=3'
+
+# Real send, one recipient only — the recommended way to prove the pipeline
+curl -X POST 'http://localhost:3000/api/campaign/send?dryRun=false&limit=1'
+```
+
+A row is eligible when it passes validation **and** is still `PENDING`, so a second call
+never re-sends a batch. Sends are sequential with `EMAIL_DELAY_MS` between them, a
+failing row is recorded and the batch continues, and each outcome is written straight
+back to the sheet. An unrecognised `dryRun` value is rejected with 400 rather than being
+treated as `false`.
+
 ## Email
 
 Sending goes through the `EmailProvider` interface
-(`src/modules/email/providers/email.provider.ts`); Phase 1 ships the nodemailer implementation.
+(`src/modules/email/providers/email.provider.ts`); nodemailer is the only implementation.
 The campaign layer never talks to nodemailer directly, so adding SES/Resend later is a new
 provider, not a rewrite.
+
+Your email copy lives in `src/modules/template/templates/mail-templates.ts` — three roles
+(`FRONTEND`, `BACKEND`, `FULL_STACK`) × two variants (`initial`, `follow_up`), using the
+Handlebars variables `{{name}}`, `{{firstName}}`, `{{company}}`, `{{role}}` and
+`{{roleLabel}}`. The `follow_up` variant can already be previewed with `?type=follow_up`;
+Phase 4 is what sends it automatically.
+
+> `MAIL_HOST` takes precedence over `MAIL_SERVICE`: nodemailer's service presets carry their
+> own host/port and would otherwise silently override it.
 
 ```env
 MAIL_SERVICE=gmail
@@ -176,7 +214,8 @@ All environment variables are read once in `src/config`; nothing else touches `p
 | `GOOGLE_SPREADSHEET_ID` | – | Default spreadsheet |
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` / `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` | – | service_account driver |
 | `MAIL_*` | see above | Outgoing mail transport |
-| `EMAIL_DELAY_MS` | `2000` | Delay between sends (Phase 3) |
+| `SEND_DEFAULT_DRY_RUN` | `true` | Fallback for `POST /campaign/send` when `?dryRun` is absent |
+| `EMAIL_DELAY_MS` | `2000` | Delay between sends |
 | `EMAIL_MAX_RETRIES` | `2` | Retry cap (Phase 3) |
 | `STALE_PROCESSING_THRESHOLD_MINUTES` | `30` | Stale `PROCESSING` recovery (Phase 4) |
 | `CRON_*` | – | Daily schedule (Phase 4) |
@@ -188,10 +227,11 @@ src/
 ├── common/filters/          # global HTTP exception filter
 ├── config/                  # typed, centralised env configuration
 ├── modules/
-│   ├── campaign/            # connect-sheet + validate endpoints
+│   ├── campaign/            # connect-sheet, validate, preview, send
 │   ├── email/               # EmailProvider abstraction + nodemailer provider
-│   └── google-sheet/        # drivers, repository, service, Candidate entity
-└── specs/                   # PRD, plan, architecture
+│   ├── google-sheet/        # drivers, repository, service, Candidate entity
+│   └── template/            # per-role email copy + Handlebars rendering
+└── specs/                   # PRD, plan, architecture, development guide
 scripts/google-sheet.gs      # Apps Script bridge to deploy
 ```
 

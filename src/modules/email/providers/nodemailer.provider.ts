@@ -40,8 +40,26 @@ export class NodemailerProvider implements EmailProvider {
   }
 
   async verify(): Promise<void> {
-    await this.getTransporter().verify();
+    try {
+      await this.getTransporter().verify();
+    } catch (error) {
+      // The SMTP reason (bad credentials, blocked port, TLS required) is the
+      // entire point of this check, so it must not be flattened into a 500.
+      throw new ServiceUnavailableException(
+        `Could not authenticate with ${this.describeHost()}: ${describeReason(error)}`,
+      );
+    }
+
     this.logger.log(`SMTP connection verified for ${this.defaultFrom()}`);
+  }
+
+  private describeHost(): string {
+    const host = this.configService.get<string>('mail.host');
+    const port = this.configService.get<number>('mail.port');
+
+    return host
+      ? `${host}:${port}`
+      : (this.configService.get<string>('mail.service') ?? 'the mail server');
   }
 
   private defaultFrom(): string {
@@ -59,14 +77,36 @@ export class NodemailerProvider implements EmailProvider {
     if (this.transporter) return this.transporter;
 
     this.transporter = nodemailer.createTransport({
-      service: this.configService.get<string>('mail.service'),
-      host: this.configService.get<string>('mail.host'),
-      port: this.configService.get<number>('mail.port'),
-      secure: this.configService.get<boolean>('mail.secure'),
+      ...this.buildConnection(),
       auth: this.buildAuth(),
     });
 
     return this.transporter;
+  }
+
+  /**
+   * Nodemailer's `service` presets carry their own host/port/secure and win over
+   * anything passed alongside them, so MAIL_HOST would silently be ignored. An
+   * explicit host is therefore always the source of truth, and `service` is only
+   * a fallback for when no host is configured.
+   */
+  private buildConnection(): Record<string, unknown> {
+    const host = this.configService.get<string>('mail.host');
+    const service = this.configService.get<string>('mail.service');
+
+    if (host) {
+      return {
+        host,
+        port: this.configService.get<number>('mail.port'),
+        secure: this.configService.get<boolean>('mail.secure'),
+      };
+    }
+
+    if (service) return { service };
+
+    throw new ServiceUnavailableException(
+      'MAIL_HOST (or MAIL_SERVICE) is not configured — cannot reach a mail server',
+    );
   }
 
   private buildAuth(): Record<string, unknown> {
@@ -101,4 +141,10 @@ export class NodemailerProvider implements EmailProvider {
       pass: this.configService.get<string>('mail.password'),
     };
   }
+}
+
+function describeReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+
+  return message.replace(/\s+/g, ' ').trim();
 }
