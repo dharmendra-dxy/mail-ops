@@ -4,6 +4,7 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { HttpExceptionFilter } from './../src/common/filters/http-exception.filter';
+import { EmailService } from './../src/modules/email';
 import { Candidate, GoogleSheetService } from './../src/modules/google-sheet';
 
 const SPREADSHEET_ID = '1X8K4-PVh_iKxqCKG5t4sDr4iiFg1cTKnb1cmnI_fb6I';
@@ -48,13 +49,19 @@ describe('Campaign endpoints (e2e)', () => {
     getConnection: jest.Mock;
     getCandidates: jest.Mock;
     connect: jest.Mock;
+    updateRow: jest.Mock;
   };
+  let emailService: { send: jest.Mock };
 
   beforeAll(async () => {
     googleSheetService = {
       getConnection: jest.fn().mockReturnValue(CONNECTION),
       getCandidates: jest.fn().mockResolvedValue([buildCandidate({})]),
       connect: jest.fn().mockResolvedValue({ ...CONNECTION, active: true }),
+      updateRow: jest.fn().mockResolvedValue(1),
+    };
+    emailService = {
+      send: jest.fn().mockResolvedValue({ messageId: 'msg-1' }),
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -62,6 +69,8 @@ describe('Campaign endpoints (e2e)', () => {
     })
       .overrideProvider(GoogleSheetService)
       .useValue(googleSheetService)
+      .overrideProvider(EmailService)
+      .useValue(emailService)
       .compile();
 
     app = moduleFixture.createNestApplication();
@@ -154,5 +163,137 @@ describe('Campaign endpoints (e2e)', () => {
         message: 'role must be one of: FRONTEND, BACKEND, FULL_STACK',
       },
     ]);
+  });
+
+  describe('GET /api/campaign/preview', () => {
+    beforeEach(() => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+        buildCandidate({
+          rowNumber: 3,
+          name: 'Vikram Rao',
+          email: 'vikram@globex.com',
+          company: 'Globex',
+          role: 'BACKEND',
+        }),
+        buildCandidate({ rowNumber: 4, status: 'SENT' }),
+      ]);
+    });
+
+    it('returns counts and rendered previews', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/api/campaign/preview')
+        .expect(200);
+
+      const body = response.body as {
+        counts: Record<string, number>;
+        eligible: number;
+        previews: Array<{ subject: string; body: string; row: number }>;
+      };
+
+      expect(body.counts).toEqual({
+        total: 3,
+        pending: 2,
+        processing: 0,
+        sent: 1,
+        failed: 0,
+      });
+      expect(body.eligible).toBe(2);
+      expect(body.previews[0].subject).toBe(
+        'Frontend role at Acme — quick question',
+      );
+      expect(body.previews[0].body).toContain('Hi Asha,');
+      expect(body.previews[1].subject).toBe(
+        'Backend role at Globex — quick question',
+      );
+      expect(emailService.send).not.toHaveBeenCalled();
+    });
+
+    it('defaults limit to 5 and honours ?limit and ?role', async () => {
+      const limited = await request(app.getHttpServer())
+        .get('/api/campaign/preview?limit=1')
+        .expect(200);
+
+      expect((limited.body as { previews: unknown[] }).previews).toHaveLength(
+        1,
+      );
+
+      const backend = await request(app.getHttpServer())
+        .get('/api/campaign/preview?role=BACKEND&type=follow_up')
+        .expect(200);
+
+      const body = backend.body as {
+        previews: Array<{ role: string; subject: string }>;
+      };
+      expect(body.previews).toHaveLength(1);
+      expect(body.previews[0].role).toBe('BACKEND');
+      expect(body.previews[0].subject).toBe('Re: Backend role at Globex');
+    });
+
+    it('rejects an unknown role or type', async () => {
+      await request(app.getHttpServer())
+        .get('/api/campaign/preview?role=DESIGNER')
+        .expect(400);
+
+      await request(app.getHttpServer())
+        .get('/api/campaign/preview?type=invoice')
+        .expect(400);
+    });
+  });
+
+  describe('POST /api/campaign/send', () => {
+    beforeEach(() => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+      ]);
+      googleSheetService.updateRow.mockClear();
+      emailService.send.mockClear();
+    });
+
+    it('is a dry run by default', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/api/campaign/send')
+        .expect(200);
+
+      expect((response.body as { dryRun: boolean }).dryRun).toBe(true);
+      expect(emailService.send).not.toHaveBeenCalled();
+      expect(googleSheetService.updateRow).not.toHaveBeenCalled();
+    });
+
+    it('treats dryRun=true the same way', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/api/campaign/send?dryRun=true')
+        .expect(200);
+
+      expect((response.body as { dryRun: boolean }).dryRun).toBe(true);
+      expect(emailService.send).not.toHaveBeenCalled();
+    });
+
+    it('sends and writes state back when dryRun=false', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/api/campaign/send?dryRun=false')
+        .expect(200);
+
+      const body = response.body as {
+        sent: number;
+        results: Array<{ status: string; messageId: string }>;
+      };
+      expect(body.sent).toBe(1);
+      expect(body.results[0]).toMatchObject({
+        status: 'SENT',
+        messageId: 'msg-1',
+      });
+      expect(emailService.send).toHaveBeenCalledTimes(1);
+      expect(googleSheetService.updateRow).toHaveBeenCalledWith(
+        2,
+        expect.objectContaining({ status: 'SENT', message_id: 'msg-1' }),
+      );
+    });
+
+    it('rejects a non-boolean dryRun value', async () => {
+      await request(app.getHttpServer())
+        .post('/api/campaign/send?dryRun=maybe')
+        .expect(400);
+    });
   });
 });

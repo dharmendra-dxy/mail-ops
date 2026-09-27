@@ -1,8 +1,9 @@
 import { registerAs } from '@nestjs/config';
 
 export default registerAs('mail', () => ({
+  /** Only used as a fallback when MAIL_HOST is empty (nodemailer presets win). */
   service: process.env.MAIL_SERVICE ?? 'gmail',
-  host: process.env.MAIL_HOST ?? 'smtp.gmail.com',
+  host: process.env.MAIL_HOST ?? '',
   port: Number.parseInt(process.env.MAIL_PORT ?? '587', 10),
   secure: (process.env.MAIL_SECURE ?? 'false') === 'true',
   from: process.env.MAIL_FROM ?? process.env.GMAIL_USER ?? '',
