@@ -1,9 +1,16 @@
-import { CandidateStatus } from '../google-sheet';
+import { CandidateStatus, FollowUpStatus } from '../google-sheet';
 
 export const PENDING: CandidateStatus = 'PENDING';
 export const PROCESSING: CandidateStatus = 'PROCESSING';
 export const SENT: CandidateStatus = 'SENT';
 export const FAILED: CandidateStatus = 'FAILED';
+
+/** Follow-up lifecycle, tracked in its own column so it runs independently. */
+export const FOLLOW_UP_NOT_SCHEDULED: FollowUpStatus = 'NOT_SCHEDULED';
+export const FOLLOW_UP_SCHEDULED: FollowUpStatus = 'SCHEDULED';
+export const FOLLOW_UP_PROCESSING: FollowUpStatus = 'PROCESSING';
+export const FOLLOW_UP_SENT: FollowUpStatus = 'SENT';
+export const FOLLOW_UP_FAILED: FollowUpStatus = 'FAILED';
 
 /** Campaign ids are `campaign-YYYYMMDD-NNN`; the date part is this prefix. */
 export const CAMPAIGN_ID_PREFIX = 'campaign-';

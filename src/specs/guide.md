@@ -4,7 +4,8 @@ What has actually been built, how to run it, and what is deliberately **not** do
 Companion to `prd.md` (what the product should be), `plan.md` (the phases) and
 `../architecture.md` (the code conventions).
 
-**Status: Phase 1 and Phase 2 complete. Phase 3+ not started.**
+**Status: Phases 1–4 complete.** This document covers Phases 1–2; see
+[`guide-2.md`](./guide-2.md) for Phase 3 and [`guide-3.md`](./guide-3.md) for Phase 4.
 
 > This guide describes the state of the project after Phase 2. **Phase 3 is now
 > implemented** — see [`guide-2.md`](./guide-2.md) for the campaign state machine,
@@ -134,7 +135,7 @@ and `follow_up_days` are the same column. Unknown extra columns are ignored.
 | `error` | app | Single-line failure reason |
 | `attempts` | app | Incremented on every send attempt |
 | `campaign_id` | Phase 3 | Not used yet |
-| `follow_up_*` (5 columns) | Phase 4 | Read and validated now, unused so far |
+| `follow_up_*` (5 columns) | Phase 4 | Read, validated, and acted on by the daily cycle (see `guide-3.md`) |
 | `processing_started_at` | Phase 3/4 | Stale-PROCESSING recovery |
 
 **Writes never touch a whole row.** Patched columns are grouped into contiguous spans
@@ -197,7 +198,7 @@ A test asserts that no template uses a placeholder outside that list, so a typo 
 `{{compnay}}` fails the build instead of silently sending a blank.
 
 The `follow_up` variant is already selectable (`?type=follow_up`) but nothing sends it
-automatically until Phase 4.
+automatically until Phase 4 (see `guide-3.md`).
 
 ---
 
@@ -322,8 +323,8 @@ Everything is read in `src/config`; see `.env.example` for a copyable template.
 | `SEND_DEFAULT_DRY_RUN` | `true` | Fallback when `?dryRun` is absent |
 | `EMAIL_DELAY_MS` | `2000` | Gap between sends |
 | `EMAIL_MAX_RETRIES` | `2` | Phase 3 |
-| `STALE_PROCESSING_THRESHOLD_MINUTES` | `30` | Phase 4 |
-| `CRON_*` | – | Phase 4 (not read yet) |
+| `STALE_PROCESSING_THRESHOLD_MINUTES` | `30` | Phase 3 |
+| `CRON_*` | – | Phase 4 (see `guide-3.md`) |
 
 ---
 

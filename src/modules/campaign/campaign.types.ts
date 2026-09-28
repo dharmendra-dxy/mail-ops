@@ -1,4 +1,5 @@
 import { CandidateRowError, SheetConnection } from '../google-sheet';
+import type { TemplateType } from '../template';
 import { CAMPAIGN_RUN_STATUS } from './campaign.constant';
 
 export interface SheetValidationReport {
@@ -85,7 +86,48 @@ export interface CampaignStartResponse {
 
 export type CampaignRunResponse = CampaignSendResponse | CampaignStartResponse;
 
-/** Follow-up columns are only aggregated here; Phase 4 acts on them. */
+/**
+ * Why a batch did not run. The single-run lock is the only reason in V1: a
+ * manual send and the daily cron must never overlap on one instance.
+ */
+export const SKIP_REASON = {
+  RUN_IN_PROGRESS: 'RUN_IN_PROGRESS',
+} as const;
+
+export type SkipReason = (typeof SKIP_REASON)[keyof typeof SKIP_REASON] | null;
+
+/** Outcome of one batch (initial emails or follow-ups) inside a run. */
+export interface BatchRunResult {
+  campaignId: string | null;
+  /** Rows that matched the eligibility filter, before the batch cap. */
+  eligible: number;
+  processed: number;
+  sent: number;
+  failed: number;
+  skipped: SkipReason;
+  /** Follow-up batches only: rows promoted `NOT_SCHEDULED` → `SCHEDULED`. */
+  promoted: number;
+}
+
+export interface DailyCycleResult {
+  startedAt: string;
+  finishedAt: string;
+  skipped: SkipReason;
+  initial: BatchRunResult;
+  followUp: BatchRunResult;
+  /** Rows moved from `NOT_SCHEDULED` to `SCHEDULED` during this cycle. */
+  promoted: number;
+}
+
+export interface ScheduledRunOptions {
+  /** Upper bound on rows per batch. Omit for "everything eligible". */
+  limit?: number;
+  /** Restricts initial emails to one role. Follow-ups ignore this. */
+  role?: string;
+  /** Template variant for initial emails. Follow-ups always render `follow_up`. */
+  type?: TemplateType;
+}
+
 export interface FollowUpCounts {
   notScheduled: number;
   scheduled: number;

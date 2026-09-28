@@ -3,9 +3,11 @@
 Personal NestJS backend that automates role-based outreach emails, using a **Google Sheet as the
 only store** — no database.
 
-> **Status: Phase 1 and Phase 2 complete.** Sheet I/O, validation, role templates, dry-run and
-> real sending are working. Campaign orchestration, cron and follow-ups land in Phases 3–4.
-> See [`src/specs/guide.md`](src/specs/guide.md) for the full development guide.
+> **Status: Phases 1–4 complete.** Sheet I/O, validation, role templates, dry-run and real
+> sending, batch orchestration, and the daily cron with follow-ups are all working. Hardening
+> and docs land in Phase 5.
+> Guides: [`guide.md`](src/specs/guide.md) (Phases 1–2), [`guide-2.md`](src/specs/guide-2.md)
+> (Phase 3), [`guide-3.md`](src/specs/guide-3.md) (Phase 4).
 
 ## Requirements
 
@@ -99,6 +101,8 @@ sensibly and are written back by later phases. Header matching is case- and sepa
 | `GET /campaign/preview` | Counts plus rendered subject/body per candidate — sends nothing |
 | `GET /campaign/status` | Live counts by status, follow-up counts, and whether a run is in flight |
 | `POST /campaign/send` | Dry run by default; `?dryRun=false` starts a real background run |
+| `GET /scheduler/status` | Whether a cron job is registered, its schedule, and the last cycle result |
+| `POST /scheduler/run` | Run the daily cycle now: due initial emails, then due follow-ups |
 | `POST /email/verify` | Check the SMTP/OAuth2 credentials before running a campaign |
 
 ### Connect a sheet
@@ -197,6 +201,61 @@ fail immediately. Every outcome is written straight back to the sheet, one faili
 row never stops the batch, and every processed row is stamped with the
 `campaign_id` of the run that touched it.
 
+### Scheduler
+
+`GET /api/scheduler/status` reports whether a cron job is actually registered:
+
+```json
+{
+  "enabled": true,
+  "registered": true,
+  "jobName": "mailops-daily-campaign",
+  "expression": "0 8 * * *",
+  "timezone": "Asia/Kolkata",
+  "batchLimit": 50,
+  "lastRunAt": "2026-09-27T02:34:11.204Z",
+  "lastRun": { "initial": { "eligible": 3, "sent": 3, "failed": 0 }, "followUp": { "eligible": 2, "sent": 2, "failed": 0 } },
+  "lastError": null,
+  "lastErrorAt": null
+}
+```
+
+With `CRON_ENABLED=false` there is **no job object at all** — `registered` is `false` and
+`expression`/`timezone` are `null`. The daily run is a single entry point that does two things in
+order, under one lock: sends every due initial email, then sends every due follow-up.
+
+To run a cycle immediately instead of waiting for the clock:
+
+```bash
+curl -X POST http://localhost:3000/api/scheduler/run
+```
+
+It returns `{ "trigger": "MANUAL", "skipped": null, "result": { ... } }`. If a campaign is already
+running, `skipped` is `RUN_IN_PROGRESS` and nothing is sent.
+
+### Follow-ups
+
+A row opts in with `follow_up_enabled=YES` and a `follow_up_days` value. The due time is
+`sent_at + follow_up_days`, computed on every run rather than stored, so editing the column takes
+effect immediately. Each cycle:
+
+1. Promotes `NOT_SCHEDULED` rows to `SCHEDULED` as soon as the initial email is on record, so the
+   sheet shows the queue before anything fires.
+2. Sends a due follow-up for rows that are `SENT`, opted in, and not already followed up —
+   including a `follow_up_status=PROCESSING` row left behind by a crash.
+
+A follow-up walks `SCHEDULED → PROCESSING → SENT | FAILED` in its own columns
+(`follow_up_status`, `follow_up_sent_at`, `follow_up_message_id`), is threaded under the original
+message via `in_reply_to`, and never touches the initial email's record. A follow-up that fails is
+**not** retried automatically — set `follow_up_status` back to `SCHEDULED` to try again.
+
+To see one fire without waiting days, set `follow_up_enabled=YES` and `follow_up_days=0` on a row
+that is already `SENT`, then trigger a cycle:
+
+```bash
+curl -X POST http://localhost:3000/api/scheduler/run | jq .result.followUp
+```
+
 ## Email
 
 Sending goes through the `EmailProvider` interface
@@ -207,8 +266,8 @@ provider, not a rewrite.
 Your email copy lives in `src/modules/template/templates/mail-templates.ts` — three roles
 (`FRONTEND`, `BACKEND`, `FULL_STACK`) × two variants (`initial`, `follow_up`), using the
 Handlebars variables `{{name}}`, `{{firstName}}`, `{{company}}`, `{{role}}` and
-`{{roleLabel}}`. The `follow_up` variant can already be previewed with `?type=follow_up`;
-Phase 4 is what sends it automatically.
+`{{roleLabel}}`. The `follow_up` variant can be previewed with `?type=follow_up` and is what the
+daily cycle sends.
 
 > `MAIL_HOST` takes precedence over `MAIL_SERVICE`: nodemailer's service presets carry their
 > own host/port and would otherwise silently override it.
@@ -253,7 +312,11 @@ All environment variables are read once in `src/config`; nothing else touches `p
 | `EMAIL_DELAY_MS` | `2000` | Delay between sends |
 | `EMAIL_MAX_RETRIES` | `2` | Retries per row for retryable failures, so 3 attempts in total |
 | `STALE_PROCESSING_THRESHOLD_MINUTES` | `30` | A `PROCESSING` row older than this is re-eligible |
-| `CRON_*` | – | Daily schedule (Phase 4) |
+| `CRON_ENABLED` | `false` | `false` registers no cron job at all |
+| `CRON_HOUR` / `CRON_MINUTE` | `8` / `0` | Local time of the daily run |
+| `CRON_TIMEZONE` | `Asia/Kolkata` | IANA zone the daily run is timed in |
+| `CRON_JOB_NAME` | `mailops-daily-campaign` | Registry key of the job |
+| `CRON_BATCH_LIMIT` | `50` | Cap per run, applied to initial emails and follow-ups separately |
 
 ## Project layout
 
@@ -265,6 +328,7 @@ src/
 │   ├── campaign/            # connect-sheet, validate, preview, status, send
 │   ├── email/               # EmailProvider abstraction + nodemailer provider
 │   ├── google-sheet/        # drivers, repository, service, Candidate entity
+│   ├── scheduler/           # daily cron registration, cycle trigger, status
 │   └── template/            # per-role email copy + Handlebars rendering
 └── specs/                   # PRD, plan, architecture, development guide
 scripts/google-sheet.gs      # Apps Script bridge to deploy

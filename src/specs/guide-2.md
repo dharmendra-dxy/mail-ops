@@ -7,7 +7,8 @@ Companions: `prd.md` (product), `plan.md` (phases), `architecture.md` (code
 conventions) and [`guide.md`](./guide.md) (Phase 1–2 background). This document
 supersedes the "What Phase 3 will add (not built yet)" section of `guide.md`.
 
-**Status: Phase 1, 2 and 3 complete. Phase 4+ not started.**
+**Status: Phases 1–4 complete.** This document covers Phase 3; see
+[`guide-3.md`](./guide-3.md) for Phase 4 (cron + follow-ups) and what remains in Phase 5.
 
 ---
 
@@ -193,7 +194,8 @@ curl http://localhost:3000/api/campaign/status
 ```
 
 Read live from the sheet on every call — the sheet, not memory, remains the
-source of truth. `followUp` is aggregation only; Phase 4 acts on those columns.
+source of truth. `followUp` is aggregation only; [`guide-3.md`](./guide-3.md) covers the Phase 4 work
+that acts on those columns.
 
 ### `POST /campaign/send` (behaviour change)
 
@@ -250,7 +252,7 @@ No new variables — Phase 3 activates two that already existed in
 | `EMAIL_DELAY_MS` | `2000` | gap between sends **and** between retries of one row |
 | `SEND_DEFAULT_DRY_RUN` | `true` | fallback when `?dryRun` is absent |
 
-`CRON_*` is still unread — that is Phase 4.
+`CRON_*` was still unread at this point — see [`guide-3.md`](./guide-3.md).
 
 ---
 
@@ -328,17 +330,17 @@ manually resolved promise and poll `GET /campaign/status`.
 
 ---
 
-## 14. Still not built (Phase 4 and 5)
+## 14. Still not built (Phase 5)
 
 Do not rely on any of this yet:
 
-- **Cron / scheduling.** `CRON_ENABLED`, `CRON_HOUR`, `CRON_MINUTE`,
-  `CRON_TIMEZONE` are still unread; nothing runs on a timer.
-- **Follow-ups.** The columns are read, validated and counted, but nothing ever
-  sends a `follow_up` template on its own.
 - **Graceful shutdown.** `app.enableShutdownHooks()` is on, but a batch in
   flight is not drained — an interrupted row relies on stale recovery.
-- **`GET /health`**, API-key guard, and the README's phase-4/5 sections.
+- **`GET /health`**, API-key guard, structured per-candidate logging, and the
+  README polish that Phase 5 calls for.
 
-Known carry-over limitation: `inReplyTo` is still threaded from `message_id`,
-which only becomes meaningful once follow-ups exist.
+Cron, the daily cycle and follow-ups all shipped in Phase 4 — see
+[`guide-3.md`](./guide-3.md).
+
+Phase 4 now makes that `inReplyTo` real: follow-ups thread under the initial
+email's `message_id` (see `guide-3.md`).
