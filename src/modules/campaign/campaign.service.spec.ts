@@ -817,6 +817,403 @@ describe('CampaignService', () => {
     });
   });
 
+  describe('follow-ups', () => {
+    const DAY_MS = 86_400_000;
+
+    /** A row that already received its initial email, days ago. */
+    const sentCandidate = (overrides: Partial<Candidate> = {}): Candidate =>
+      buildCandidate({
+        status: 'SENT',
+        sentAt: new Date(Date.now() - 5 * DAY_MS).toISOString(),
+        messageId: '<initial-1@example.com>',
+        followUpEnabled: 'YES',
+        followUpDays: 3,
+        ...overrides,
+      });
+
+    it('promotes a due row to SCHEDULED, then sends the follow_up template', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({ rowNumber: 2, followUpStatus: 'NOT_SCHEDULED' }),
+      ]);
+      emailService.send.mockResolvedValue({ messageId: 'follow-up-1' });
+
+      const result = await service.processFollowUps();
+
+      expect(result).toMatchObject({
+        eligible: 1,
+        processed: 1,
+        sent: 1,
+        failed: 0,
+        skipped: null,
+        promoted: 1,
+      });
+
+      // The promotion is its own write, so it stays visible even on a day
+      // where the follow-up is not due yet.
+      expect(rowOf(0)).toBe(2);
+      expect(patchOf(0)).toEqual({
+        [SHEET_COLUMNS.FOLLOW_UP_STATUS]: 'SCHEDULED',
+      });
+
+      expect(patchOf(1)).toMatchObject({
+        [SHEET_COLUMNS.FOLLOW_UP_STATUS]: 'PROCESSING',
+        [SHEET_COLUMNS.CAMPAIGN_ID]: result.campaignId,
+      });
+      expect(patchOf(2)).toMatchObject({
+        [SHEET_COLUMNS.FOLLOW_UP_STATUS]: 'SENT',
+        [SHEET_COLUMNS.FOLLOW_UP_MESSAGE_ID]: 'follow-up-1',
+        [SHEET_COLUMNS.ERROR]: '',
+      });
+      expect(patchOf(2)[SHEET_COLUMNS.FOLLOW_UP_SENT_AT]).toEqual(
+        expect.any(String),
+      );
+
+      // The initial record must not be touched by the follow-up.
+      expect(patchOf(2)[SHEET_COLUMNS.STATUS]).toBeUndefined();
+      expect(patchOf(2)[SHEET_COLUMNS.SENT_AT]).toBeUndefined();
+
+      expect(emailService.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'asha@example.com',
+          subject: 'Re: Frontend role at Acme',
+          inReplyTo: '<initial-1@example.com>',
+        }),
+      );
+    });
+
+    it('sends on the very next tick when follow_up_days is 0', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({ followUpDays: 0, followUpStatus: 'SCHEDULED' }),
+      ]);
+      emailService.send.mockResolvedValue({ messageId: 'follow-up-1' });
+
+      const result = await service.processFollowUps();
+
+      expect(result.sent).toBe(1);
+    });
+
+    it('waits until sent_at + follow_up_days', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({
+          sentAt: new Date(Date.now() - 2 * DAY_MS).toISOString(),
+          followUpDays: 7,
+          followUpStatus: 'SCHEDULED',
+        }),
+      ]);
+
+      const result = await service.processFollowUps();
+
+      expect(result.eligible).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+    });
+
+    it('ignores rows that did not opt in or whose initial email is not SENT', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({ rowNumber: 2, followUpEnabled: 'NO' }),
+        buildCandidate({ rowNumber: 3, followUpEnabled: 'YES' }),
+        buildCandidate({
+          rowNumber: 4,
+          status: 'FAILED',
+          followUpEnabled: 'YES',
+        }),
+      ]);
+
+      const result = await service.processFollowUps();
+
+      expect(result.eligible).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+    });
+
+    it('never sends the same follow-up twice', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({
+          followUpStatus: 'SENT',
+          followUpSentAt: new Date().toISOString(),
+        }),
+      ]);
+
+      const result = await service.processFollowUps();
+
+      expect(result.eligible).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+    });
+
+    it('does not auto-retry a FAILED follow-up', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({ followUpStatus: 'FAILED', error: '550 no such user' }),
+      ]);
+      const warn = jest.spyOn(
+        (service as unknown as { logger: { warn: jest.Mock } }).logger,
+        'warn',
+      );
+
+      const result = await service.processFollowUps();
+
+      expect(result.eligible).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('follow-up already FAILED'),
+      );
+      warn.mockRestore();
+    });
+
+    it('recovers a stale follow-up PROCESSING row and leaves a fresh one alone', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({
+          rowNumber: 2,
+          followUpStatus: 'PROCESSING',
+          processingStartedAt: new Date(
+            Date.now() - 45 * MINUTE_MS,
+          ).toISOString(),
+        }),
+        sentCandidate({
+          rowNumber: 3,
+          followUpStatus: 'PROCESSING',
+          processingStartedAt: new Date(Date.now() - MINUTE_MS).toISOString(),
+        }),
+      ]);
+      emailService.send.mockResolvedValue({ messageId: 'follow-up-1' });
+
+      const result = await service.processFollowUps();
+
+      expect(result.sent).toBe(1);
+      expect(emailService.send).toHaveBeenCalledWith(
+        expect.objectContaining({ to: 'asha@example.com' }),
+      );
+    });
+
+    it('reports a row whose timing cannot be read instead of sending blindly', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({ sentAt: 'not-a-date' }),
+        sentCandidate({ rowNumber: 3, followUpDays: Number.NaN }),
+      ]);
+      const warn = jest.spyOn(
+        (service as unknown as { logger: { warn: jest.Mock } }).logger,
+        'warn',
+      );
+
+      const result = await service.processFollowUps();
+
+      expect(result.eligible).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('unusable sent_at or follow_up_days: 2, 3'),
+      );
+      warn.mockRestore();
+    });
+
+    it('retries a retryable failure and marks the follow-up FAILED otherwise', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({ rowNumber: 2, followUpStatus: 'SCHEDULED' }),
+      ]);
+      emailService.send
+        .mockRejectedValueOnce(new Error('ETIMEDOUT connection timed out'))
+        .mockResolvedValueOnce({ messageId: 'follow-up-1' });
+
+      const recovered = await service.processFollowUps();
+
+      expect(recovered.sent).toBe(1);
+      expect(emailService.send).toHaveBeenCalledTimes(2);
+
+      googleSheetService.updateRow.mockClear();
+      emailService.send.mockReset();
+      emailService.send.mockRejectedValue(
+        new Error(
+          '550 5.1.1 The email account that you tried to reach does not exist',
+        ),
+      );
+
+      const failed = await service.processFollowUps();
+
+      expect(failed.failed).toBe(1);
+      expect(emailService.send).toHaveBeenCalledTimes(1);
+      expect(
+        patchOf(googleSheetService.updateRow.mock.calls.length - 1),
+      ).toMatchObject({
+        [SHEET_COLUMNS.FOLLOW_UP_STATUS]: 'FAILED',
+        [SHEET_COLUMNS.ERROR]:
+          '550 5.1.1 The email account that you tried to reach does not exist',
+      });
+    });
+
+    it('skips a follow-up for a row that fails sheet validation', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({ email: 'not-an-email' }),
+      ]);
+
+      const result = await service.processFollowUps();
+
+      expect(result.eligible).toBe(0);
+      expect(emailService.send).not.toHaveBeenCalled();
+    });
+
+    it('honours the batch limit and leaves the rest for the next run', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        sentCandidate({ rowNumber: 2 }),
+        sentCandidate({ rowNumber: 3, email: 'vikram@globex.com' }),
+      ]);
+      emailService.send.mockResolvedValue({ messageId: 'follow-up-1' });
+
+      const result = await service.processFollowUps({ limit: 1 });
+
+      expect(result.eligible).toBe(1);
+      expect(result.sent).toBe(1);
+      expect(emailService.send).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('runDailyCycle', () => {
+    const DAY_MS = 86_400_000;
+
+    it('sends due initial emails, then due follow-ups, under one lock', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+        buildCandidate({
+          rowNumber: 3,
+          email: 'hr@globex.com',
+          status: 'SENT',
+          sentAt: new Date(Date.now() - 5 * DAY_MS).toISOString(),
+          messageId: '<initial-3@example.com>',
+          followUpEnabled: 'YES',
+          followUpDays: 3,
+          followUpStatus: 'SCHEDULED',
+        }),
+      ]);
+      emailService.send
+        .mockResolvedValueOnce({ messageId: 'msg-1' })
+        .mockResolvedValueOnce({ messageId: 'follow-up-1' });
+
+      const result = await service.runDailyCycle();
+
+      expect(result.skipped).toBeNull();
+      expect(result.initial).toMatchObject({ sent: 1, failed: 0, eligible: 1 });
+      expect(result.followUp).toMatchObject({
+        sent: 1,
+        failed: 0,
+        eligible: 1,
+      });
+      expect(Date.parse(result.finishedAt)).toBeGreaterThanOrEqual(
+        Date.parse(result.startedAt),
+      );
+
+      expect(emailService.send).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          subject: 'Frontend role at Acme — quick question',
+        }),
+      );
+      expect(emailService.send).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ subject: 'Re: Frontend role at Acme' }),
+      );
+    });
+
+    it('numbers each half of the cycle from the ids already on the sheet', async () => {
+      // A stateful sheet: the follow-up half must see the campaign id the
+      // initial half just stamped, exactly as a real re-read would.
+      const rows = [
+        buildCandidate({ rowNumber: 2 }),
+        buildCandidate({
+          rowNumber: 3,
+          status: 'SENT',
+          sentAt: new Date(Date.now() - DAY_MS).toISOString(),
+          followUpEnabled: 'YES',
+          followUpDays: 0,
+          followUpStatus: 'SCHEDULED',
+        }),
+      ];
+      googleSheetService.getCandidates.mockImplementation(() =>
+        Promise.resolve(rows.map((row) => Object.assign(new Candidate(), row))),
+      );
+      googleSheetService.updateRow.mockImplementation(
+        (rowNumber: number, patch: Record<string, unknown>) => {
+          const target = rows.find(
+            (row) => row.rowNumber === rowNumber,
+          ) as Candidate;
+          // Patches are keyed by sheet column; the entity uses camelCase.
+          Object.assign(target, {
+            ...patch,
+            campaignId: patch[SHEET_COLUMNS.CAMPAIGN_ID] ?? target.campaignId,
+          });
+          return 1;
+        },
+      );
+      emailService.send.mockResolvedValue({ messageId: 'msg-1' });
+
+      const result = await service.runDailyCycle();
+
+      expect(result.initial.campaignId).toMatch(/-001$/);
+      expect(result.followUp.campaignId).toMatch(/-002$/);
+    });
+
+    it('is a no-op on an empty sheet and still releases the lock', async () => {
+      const result = await service.runDailyCycle();
+
+      expect(result).toMatchObject({
+        skipped: null,
+        initial: { eligible: 0, campaignId: null },
+        followUp: { eligible: 0, campaignId: null },
+        promoted: 0,
+      });
+      expect(emailService.send).not.toHaveBeenCalled();
+      await expect(service.getStatus()).resolves.toMatchObject({
+        running: false,
+      });
+    });
+
+    it('skips the cycle when a manual run already holds the lock', async () => {
+      const gate = deferred();
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+      ]);
+      emailService.send.mockReturnValue(gate.promise);
+
+      const manual = service.send(
+        Object.assign(new SendCampaignDto(), { dryRun: false }),
+      );
+      const skipped = await service.runDailyCycle();
+
+      expect(skipped.skipped).toBe('RUN_IN_PROGRESS');
+      expect(skipped.initial.sent).toBe(0);
+      expect(skipped.followUp.sent).toBe(0);
+
+      gate.resolve({ messageId: 'msg-1' });
+      await manual;
+      await waitForIdle();
+    });
+
+    it('applies the batch limit to each half independently', async () => {
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+        buildCandidate({ rowNumber: 3, email: 'hr@globex.com' }),
+        buildCandidate({
+          rowNumber: 4,
+          status: 'SENT',
+          sentAt: new Date(Date.now() - DAY_MS).toISOString(),
+          followUpEnabled: 'YES',
+          followUpDays: 0,
+          followUpStatus: 'SCHEDULED',
+        }),
+        buildCandidate({
+          rowNumber: 5,
+          email: 'talent@initech.com',
+          status: 'SENT',
+          sentAt: new Date(Date.now() - DAY_MS).toISOString(),
+          followUpEnabled: 'YES',
+          followUpDays: 0,
+          followUpStatus: 'SCHEDULED',
+        }),
+      ]);
+      emailService.send.mockResolvedValue({ messageId: 'msg-1' });
+
+      const result = await service.runDailyCycle({ limit: 1 });
+
+      expect(result.initial.sent).toBe(1);
+      expect(result.followUp.sent).toBe(1);
+      expect(emailService.send).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it('delegates connect to the sheet service', async () => {
     googleSheetService.connect.mockResolvedValue({
       ...CONNECTION,

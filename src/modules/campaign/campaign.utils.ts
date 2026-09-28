@@ -11,6 +11,9 @@ import {
   RETRYABLE_ERROR_PATTERNS,
 } from './campaign.constant';
 
+/** `follow_up_days` is counted in 24h windows from `sent_at`. */
+export const MILLISECONDS_PER_DAY = 86_400_000;
+
 /** Provider errors are multi-line; the sheet cell only needs one line. */
 export function describeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -84,11 +87,58 @@ export function isStaleProcessing(
   thresholdMinutes: number,
   now: number = Date.now(),
 ): boolean {
-  const startedAt = candidate.processingStartedAt
-    ? Date.parse(candidate.processingStartedAt)
-    : Number.NaN;
+  return isStaleSince(candidate.processingStartedAt, thresholdMinutes, now);
+}
 
-  if (Number.isNaN(startedAt)) return true;
+function isStaleSince(
+  startedAt: string | null | undefined,
+  thresholdMinutes: number,
+  now: number,
+): boolean {
+  const parsed = startedAt ? Date.parse(startedAt) : Number.NaN;
 
-  return now - startedAt >= thresholdMinutes * MILLISECONDS_PER_MINUTE;
+  if (Number.isNaN(parsed)) return true;
+
+  return now - parsed >= thresholdMinutes * MILLISECONDS_PER_MINUTE;
+}
+
+/**
+ * When a follow-up becomes due: `sent_at + follow_up_days`.
+ *
+ * Computed from the sheet on every run rather than stored, so editing
+ * `follow_up_days` takes effect immediately with no migration. Returns null when
+ * the row has no `sent_at` yet or the day count is unusable.
+ */
+export function followUpDueAt(candidate: Candidate): Date | null {
+  if (!candidate.sentAt) return null;
+
+  const sentAt = Date.parse(candidate.sentAt);
+  if (Number.isNaN(sentAt)) return null;
+
+  const days = candidate.followUpDays;
+  if (typeof days !== 'number' || !Number.isFinite(days) || days < 0)
+    return null;
+
+  return new Date(sentAt + days * MILLISECONDS_PER_DAY);
+}
+
+export function isFollowUpDue(
+  candidate: Candidate,
+  now: number = Date.now(),
+): boolean {
+  const dueAt = followUpDueAt(candidate);
+
+  return dueAt !== null && dueAt.getTime() <= now;
+}
+
+/**
+ * Follow-ups reuse the single `processing_started_at` column, so a crashed
+ * follow-up is recovered exactly like a crashed initial send.
+ */
+export function isStaleFollowUpProcessing(
+  candidate: Candidate,
+  thresholdMinutes: number,
+  now: number = Date.now(),
+): boolean {
+  return isStaleSince(candidate.processingStartedAt, thresholdMinutes, now);
 }

@@ -56,6 +56,10 @@ export class CampaignController {
    * SEND_DEFAULT_DRY_RUN controls. A dry run answers with the rendered emails;
    * a real send answers `STARTED` immediately and runs in the background.
    * A second concurrent run is rejected with 409.
+   *
+   * Follow-ups are never sent from here: they are driven by the daily cycle in
+   * `POST /scheduler/run` (or by the cron), so a manual batch cannot
+   * accidentally mail somebody twice in one sitting.
    */
   @Post('send')
   @HttpCode(HttpStatus.OK)

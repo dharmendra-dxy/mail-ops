@@ -10,7 +10,12 @@ import {
   SHEET_COLUMNS,
   SheetConnection,
 } from '../google-sheet';
-import { RenderedEmail, TemplateService, TemplateType } from '../template';
+import {
+  RenderedEmail,
+  TEMPLATE_TYPES,
+  TemplateService,
+  TemplateType,
+} from '../template';
 import {
   CAMPAIGN_RUN_STATUS,
   DEFAULT_EMAIL_DELAY_MS,
@@ -18,11 +23,17 @@ import {
   DEFAULT_STALE_PROCESSING_THRESHOLD_MINUTES,
   ERROR_CLASSIFICATION,
   FAILED,
+  FOLLOW_UP_FAILED,
+  FOLLOW_UP_NOT_SCHEDULED,
+  FOLLOW_UP_PROCESSING,
+  FOLLOW_UP_SCHEDULED,
+  FOLLOW_UP_SENT,
   PENDING,
   PROCESSING,
   SENT,
 } from './campaign.constant';
 import {
+  BatchRunResult,
   CampaignCounts,
   CampaignPreviewResponse,
   CampaignRunResponse,
@@ -30,14 +41,20 @@ import {
   CampaignStatusResponse,
   CandidatePreview,
   ConnectSheetResponse,
+  DailyCycleResult,
   FollowUpCounts,
+  ScheduledRunOptions,
   SendResultRow,
   SheetValidationReport,
+  SKIP_REASON,
 } from './campaign.types';
 import {
   classifyEmailError,
   describeError,
   formatDryRunCampaignId,
+  followUpDueAt,
+  isFollowUpDue,
+  isStaleFollowUpProcessing,
   isStaleProcessing,
   nextCampaignId,
 } from './campaign.utils';
@@ -49,6 +66,13 @@ const VALIDATION_OPTIONS = {
   forbidUnknownValues: false,
   validationError: { target: false, value: false },
 };
+
+/** Which columns of a row a batch writes, so both paths log the same way. */
+type SendKind = 'initial' | 'follow-up';
+
+type SendOutcome =
+  | { ok: true; messageId: string; attempts: number }
+  | { ok: false; reason: string; attempts: number };
 
 @Injectable()
 export class CampaignService {
@@ -203,13 +227,12 @@ export class CampaignService {
     );
 
     this.activeCampaignId = campaignId;
-    this.logger.log(
-      `Campaign ${campaignId} started for ${eligible.length} candidate(s)` +
-        `${dto.role ? ` (role=${dto.role})` : ''}`,
-    );
 
     // Ownership of the lock moves to the background run, which releases it.
-    void this.executeCampaign(campaignId, eligible, dto.type);
+    void this.spawnRun(
+      { role: dto.role, type: dto.type },
+      { campaignId, eligible },
+    );
 
     return {
       connection,
@@ -217,6 +240,187 @@ export class CampaignService {
       campaignId,
       dryRun: false,
       total: eligible.length,
+    };
+  }
+
+  /**
+   * Detached run for `POST /campaign/send`. The caller already holds the lock
+   * and has already read the sheet, so the resolved batch is handed over as-is:
+   * a second read would cost an extra Sheet call per campaign and could return
+   * a different row set than the one the response counted.
+   */
+  private async spawnRun(
+    options: ScheduledRunOptions,
+    preset: { campaignId: string; eligible: Candidate[] },
+  ): Promise<void> {
+    try {
+      await this.runInitialBatch(options, preset);
+    } catch (error) {
+      // Stamping the batch can fail before the row loop starts; without this
+      // the run would silently keep the lock forever.
+      this.logger.error(
+        `Campaign ${preset.campaignId} aborted before sending: ${describeError(error)}`,
+      );
+    } finally {
+      this.releaseRun();
+    }
+  }
+
+  /**
+   * The single daily cycle: due initial emails first, then due follow-ups.
+   * One lock covers both so a follow-up can never start while an initial batch
+   * is still settling rows.
+   */
+  async runDailyCycle(
+    options: ScheduledRunOptions = {},
+  ): Promise<DailyCycleResult> {
+    const startedAt = new Date().toISOString();
+
+    if (!this.tryAcquireRun()) {
+      this.logger.warn(
+        `Scheduled cycle skipped${
+          this.activeCampaignId ? ` (${this.activeCampaignId} is running)` : ''
+        }. Check GET /campaign/status.`,
+      );
+
+      return this.buildCycleResult(startedAt, SKIP_REASON.RUN_IN_PROGRESS);
+    }
+
+    this.logger.log(
+      'Scheduled cycle started (initial emails, then follow-ups)',
+    );
+
+    try {
+      const initial = await this.runInitialBatch(options);
+      const followUp = await this.runFollowUpBatch(options);
+
+      const result = this.buildCycleResult(startedAt, null, initial, followUp);
+      this.logger.log(
+        `Scheduled cycle finished: initial sent=${initial.sent} failed=${initial.failed}, ` +
+          `follow-ups sent=${followUp.sent} failed=${followUp.failed}, promoted=${result.promoted}`,
+      );
+
+      return result;
+    } finally {
+      this.releaseRun();
+    }
+  }
+
+  /**
+   * Sends every due initial email. Used by the daily cycle and available for
+   * scripts; returns `skipped` instead of throwing when a run already holds the
+   * lock, because a cron tick must never take the process down.
+   */
+  async processScheduledEmails(
+    options: ScheduledRunOptions = {},
+  ): Promise<BatchRunResult> {
+    if (!this.tryAcquireRun()) {
+      this.logger.warn(
+        'Initial-email batch skipped: a run is already in progress',
+      );
+      return this.buildBatchResult(SKIP_REASON.RUN_IN_PROGRESS);
+    }
+
+    try {
+      return await this.runInitialBatch(options);
+    } finally {
+      this.releaseRun();
+    }
+  }
+
+  /**
+   * Sends every due follow-up. Follow-ups run in their own `PROCESSING` state
+   * and their own columns, so an initial failure can never block one and vice
+   * versa.
+   */
+  async processFollowUps(
+    options: ScheduledRunOptions = {},
+  ): Promise<BatchRunResult> {
+    if (!this.tryAcquireRun()) {
+      this.logger.warn('Follow-up batch skipped: a run is already in progress');
+      return this.buildBatchResult(SKIP_REASON.RUN_IN_PROGRESS);
+    }
+
+    try {
+      return await this.runFollowUpBatch(options);
+    } finally {
+      this.releaseRun();
+    }
+  }
+
+  /** Initial-email half of a run. The caller must already hold the lock. */
+  private async runInitialBatch(
+    options: ScheduledRunOptions,
+    preset?: { campaignId: string; eligible: Candidate[] },
+  ): Promise<BatchRunResult> {
+    const batch = preset ?? (await this.resolveInitialBatch(options));
+
+    if (batch.eligible.length === 0) {
+      this.logger.debug('No initial emails are due');
+      return this.buildBatchResult(null, 0);
+    }
+
+    this.activeCampaignId = batch.campaignId;
+    this.logger.log(
+      `Campaign ${batch.campaignId} started for ${batch.eligible.length} candidate(s)` +
+        `${options.role ? ` (role=${options.role})` : ''}`,
+    );
+
+    return this.executeCampaign(
+      batch.campaignId,
+      batch.eligible,
+      options.type ?? TEMPLATE_TYPES.INITIAL,
+    );
+  }
+
+  /** Reads the sheet and picks the rows a fresh batch should send. */
+  private async resolveInitialBatch(
+    options: ScheduledRunOptions,
+  ): Promise<{ campaignId: string; eligible: Candidate[] }> {
+    const connection = this.googleSheetService.getConnection();
+    const candidates = await this.googleSheetService.getCandidates(connection);
+    const allEligible = await this.filterEligible(candidates, {
+      role: options.role,
+    });
+    const eligible = this.capBatch(allEligible, options.limit, 'initial email');
+
+    return {
+      campaignId: nextCampaignId(
+        candidates.map((candidate) => candidate.campaignId),
+        new Date(),
+      ),
+      eligible,
+    };
+  }
+
+  /** Follow-up half of a run. The caller must already hold the lock. */
+  private async runFollowUpBatch(
+    options: ScheduledRunOptions,
+  ): Promise<BatchRunResult> {
+    const connection = this.googleSheetService.getConnection();
+    const candidates = await this.googleSheetService.getCandidates(connection);
+    const promoted = await this.promoteScheduledFollowUps(candidates);
+    const due = await this.filterDueFollowUps(candidates);
+    const eligible = this.capBatch(due, options.limit, 'follow-up');
+
+    if (eligible.length === 0) {
+      this.logger.debug('No follow-ups are due');
+      return { ...this.buildBatchResult(null, 0), promoted };
+    }
+
+    const campaignId = nextCampaignId(
+      candidates.map((candidate) => candidate.campaignId),
+      new Date(),
+    );
+    this.activeCampaignId = campaignId;
+
+    this.logger.log(
+      `Follow-up campaign ${campaignId} started for ${eligible.length} row(s)`,
+    );
+
+    return {
+      ...(await this.executeFollowUpCampaign(campaignId, eligible)),
+      promoted,
     };
   }
 
@@ -255,17 +459,20 @@ export class CampaignService {
   }
 
   /**
-   * Runs one campaign to completion. Each row is settled before the next one
-   * starts, so a single failure can never take the batch with it.
+   * Runs one initial-email campaign to completion. Each row is settled before
+   * the next one starts, so a single failure can never take the batch with it.
    */
   private async executeCampaign(
     campaignId: string,
     candidates: Candidate[],
     type: TemplateType,
-  ): Promise<void> {
+  ): Promise<BatchRunResult> {
+    const result = this.buildBatchResult(null, candidates.length, campaignId);
+
     try {
       for (const [index, candidate] of candidates.entries()) {
-        await this.processCandidate(candidate, campaignId, type);
+        const sent = await this.processCandidate(candidate, campaignId, type);
+        this.countResult(result, sent);
 
         if (index < candidates.length - 1) {
           await this.delayBetweenSends();
@@ -279,9 +486,36 @@ export class CampaignService {
       this.logger.error(
         `Campaign ${campaignId} aborted: ${describeError(error)}`,
       );
-    } finally {
-      this.releaseRun();
     }
+
+    return result;
+  }
+
+  /** Follow-up counterpart of `executeCampaign`. */
+  private async executeFollowUpCampaign(
+    campaignId: string,
+    candidates: Candidate[],
+  ): Promise<BatchRunResult> {
+    const result = this.buildBatchResult(null, candidates.length, campaignId);
+
+    try {
+      for (const [index, candidate] of candidates.entries()) {
+        const sent = await this.processFollowUpCandidate(candidate, campaignId);
+        this.countResult(result, sent);
+
+        if (index < candidates.length - 1) {
+          await this.delayBetweenSends();
+        }
+      }
+
+      this.logger.log(`Follow-up campaign ${campaignId} finished`);
+    } catch (error) {
+      this.logger.error(
+        `Follow-up campaign ${campaignId} aborted: ${describeError(error)}`,
+      );
+    }
+
+    return result;
   }
 
   /**
@@ -293,7 +527,7 @@ export class CampaignService {
     candidate: Candidate,
     campaignId: string,
     type: TemplateType,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { rowNumber, email } = candidate;
     let rendered: RenderedEmail;
 
@@ -312,30 +546,143 @@ export class CampaignService {
       this.logger.error(
         `Row ${rowNumber} template failed for ${email}: ${reason}`,
       );
-      return;
+      return false;
     }
 
     await this.markProcessing(candidate, campaignId);
 
     const maxAttempts = this.getMaxAttempts();
-    let attempts = candidate.attempts;
+    const outcome = await this.sendWithRetry({
+      rowNumber,
+      email,
+      kind: 'initial',
+      subject: rendered.subject,
+      body: rendered.body,
+      attempts: candidate.attempts,
+      maxAttempts,
+    });
+
+    if (!outcome.ok) {
+      await this.markFailed(
+        candidate,
+        campaignId,
+        outcome.reason,
+        outcome.attempts,
+      );
+      this.logger.error(
+        `Row ${rowNumber} FAILED to=${email} after ${outcome.attempts} attempt(s): ${outcome.reason}`,
+      );
+      return false;
+    }
+
+    // Deliberately outside the send path: the mail is already out, so a
+    // failed sheet write must abort the run rather than resend the row. The
+    // row stays PROCESSING and stale recovery picks it up.
+    await this.googleSheetService.updateRow(rowNumber, {
+      [SHEET_COLUMNS.STATUS]: SENT,
+      [SHEET_COLUMNS.SENT_AT]: new Date().toISOString(),
+      [SHEET_COLUMNS.MESSAGE_ID]: outcome.messageId,
+      [SHEET_COLUMNS.ERROR]: '',
+      [SHEET_COLUMNS.ATTEMPTS]: outcome.attempts,
+    });
+
+    this.logger.log(
+      `Row ${rowNumber} SENT to=${email} attempts=${outcome.attempts}/${maxAttempts} messageId=${outcome.messageId}`,
+    );
+    return true;
+  }
+
+  /**
+   * Follow-up equivalent of `processCandidate`. It threads the mail under the
+   * original message id and writes only follow-up columns, so the initial
+   * record in the sheet stays exactly as it was.
+   */
+  private async processFollowUpCandidate(
+    candidate: Candidate,
+    campaignId: string,
+  ): Promise<boolean> {
+    const { rowNumber, email } = candidate;
+    let rendered: RenderedEmail;
+
+    try {
+      rendered = this.renderEmail(candidate, TEMPLATE_TYPES.FOLLOW_UP);
+    } catch (error) {
+      const reason = describeError(error);
+      await this.markFollowUpFailed(candidate, campaignId, reason);
+      this.logger.error(
+        `Row ${rowNumber} follow-up template failed for ${email}: ${reason}`,
+      );
+      return false;
+    }
+
+    await this.markFollowUpProcessing(candidate, campaignId);
+
+    const outcome = await this.sendWithRetry({
+      rowNumber,
+      email,
+      kind: 'follow-up',
+      subject: rendered.subject,
+      body: rendered.body,
+      inReplyTo: candidate.messageId ?? undefined,
+      // Follow-up attempts are counted per run, not in the shared `attempts`
+      // column, which is the initial email's own budget.
+      attempts: 0,
+      maxAttempts: this.getMaxAttempts(),
+    });
+
+    if (!outcome.ok) {
+      await this.markFollowUpFailed(candidate, campaignId, outcome.reason);
+      this.logger.error(
+        `Row ${rowNumber} follow-up FAILED to=${email} after ${outcome.attempts} attempt(s): ${outcome.reason}`,
+      );
+      return false;
+    }
+
+    await this.googleSheetService.updateRow(rowNumber, {
+      [SHEET_COLUMNS.FOLLOW_UP_STATUS]: FOLLOW_UP_SENT,
+      [SHEET_COLUMNS.FOLLOW_UP_SENT_AT]: new Date().toISOString(),
+      [SHEET_COLUMNS.FOLLOW_UP_MESSAGE_ID]: outcome.messageId,
+      [SHEET_COLUMNS.ERROR]: '',
+    });
+
+    this.logger.log(
+      `Row ${rowNumber} follow-up SENT to=${email} attempts=${outcome.attempts} messageId=${outcome.messageId}`,
+    );
+    return true;
+  }
+
+  /**
+   * The provider call plus its in-place retries, shared by both paths so the
+   * classification rules cannot drift apart. It never writes to the sheet: the
+   * caller owns the state transition, which keeps "the mail is out but the
+   * write failed" distinguishable from a send failure.
+   */
+  private async sendWithRetry(params: {
+    rowNumber: number;
+    email: string;
+    kind: SendKind;
+    subject: string;
+    body: string;
+    inReplyTo?: string;
+    attempts: number;
+    maxAttempts: number;
+  }): Promise<SendOutcome> {
+    const { rowNumber, email, kind, maxAttempts } = params;
+    let attempts = params.attempts;
     let lastError: unknown;
 
     while (attempts < maxAttempts) {
       attempts += 1;
 
-      let messageId: string;
-
       try {
         const sent = await this.emailService.send({
           to: email,
-          subject: rendered.subject,
-          body: rendered.body,
-          // Threads the follow-up under this message in Phase 4.
-          inReplyTo: candidate.messageId ?? undefined,
+          subject: params.subject,
+          body: params.body,
+          inReplyTo: params.inReplyTo,
         });
 
-        messageId = sent.messageId;
+        return { ok: true, messageId: sent.messageId, attempts };
       } catch (error) {
         lastError = error;
 
@@ -344,47 +691,26 @@ export class CampaignService {
 
         if (!isRetryable) {
           this.logger.warn(
-            `Row ${rowNumber} attempt ${attempts}/${maxAttempts} failed permanently: ${describeError(error)}`,
+            `Row ${rowNumber} ${kind} attempt ${attempts}/${maxAttempts} failed permanently: ${describeError(error)}`,
           );
           break;
         }
 
         if (attempts >= maxAttempts) {
           this.logger.warn(
-            `Row ${rowNumber} attempt ${attempts}/${maxAttempts} failed retryably, retry budget exhausted: ${describeError(error)}`,
+            `Row ${rowNumber} ${kind} attempt ${attempts}/${maxAttempts} failed retryably, retry budget exhausted: ${describeError(error)}`,
           );
           break;
         }
 
         this.logger.warn(
-          `Row ${rowNumber} attempt ${attempts}/${maxAttempts} failed retryably, retrying: ${describeError(error)}`,
+          `Row ${rowNumber} ${kind} attempt ${attempts}/${maxAttempts} failed retryably, retrying: ${describeError(error)}`,
         );
         await this.delayBetweenSends();
-        continue;
       }
-
-      // Deliberately outside the try above: the mail is already out, so a
-      // failed sheet write must abort the run rather than resend the row. The
-      // row stays PROCESSING and stale recovery picks it up.
-      await this.googleSheetService.updateRow(rowNumber, {
-        [SHEET_COLUMNS.STATUS]: SENT,
-        [SHEET_COLUMNS.SENT_AT]: new Date().toISOString(),
-        [SHEET_COLUMNS.MESSAGE_ID]: messageId,
-        [SHEET_COLUMNS.ERROR]: '',
-        [SHEET_COLUMNS.ATTEMPTS]: attempts,
-      });
-
-      this.logger.log(
-        `Row ${rowNumber} SENT to=${email} attempts=${attempts}/${maxAttempts} messageId=${messageId}`,
-      );
-      return;
     }
 
-    const reason = describeError(lastError);
-    await this.markFailed(candidate, campaignId, reason, attempts);
-    this.logger.error(
-      `Row ${rowNumber} FAILED to=${email} after ${attempts} attempt(s): ${reason}`,
-    );
+    return { ok: false, reason: describeError(lastError), attempts };
   }
 
   /** The pre-send lock. Written before anything is handed to the provider. */
@@ -409,6 +735,30 @@ export class CampaignService {
       [SHEET_COLUMNS.STATUS]: FAILED,
       [SHEET_COLUMNS.ERROR]: reason,
       [SHEET_COLUMNS.ATTEMPTS]: attempts,
+      [SHEET_COLUMNS.CAMPAIGN_ID]: campaignId,
+    });
+  }
+
+  /** Follow-up pre-send lock. `processing_started_at` is shared, not duplicated. */
+  private async markFollowUpProcessing(
+    candidate: Candidate,
+    campaignId: string,
+  ): Promise<void> {
+    await this.googleSheetService.updateRow(candidate.rowNumber, {
+      [SHEET_COLUMNS.FOLLOW_UP_STATUS]: FOLLOW_UP_PROCESSING,
+      [SHEET_COLUMNS.PROCESSING_STARTED_AT]: new Date().toISOString(),
+      [SHEET_COLUMNS.CAMPAIGN_ID]: campaignId,
+    });
+  }
+
+  private async markFollowUpFailed(
+    candidate: Candidate,
+    campaignId: string,
+    reason: string,
+  ): Promise<void> {
+    await this.googleSheetService.updateRow(candidate.rowNumber, {
+      [SHEET_COLUMNS.FOLLOW_UP_STATUS]: FOLLOW_UP_FAILED,
+      [SHEET_COLUMNS.ERROR]: reason,
       [SHEET_COLUMNS.CAMPAIGN_ID]: campaignId,
     });
   }
@@ -516,21 +866,197 @@ export class CampaignService {
     return eligible;
   }
 
+  /**
+   * Moves `NOT_SCHEDULED` rows to `SCHEDULED` as soon as the initial email is
+   * on record, so the sheet shows the queue before anything fires. It is a
+   * separate write from the send, so the promotion is visible even on a day
+   * where the follow-up is not due yet.
+   */
+  private async promoteScheduledFollowUps(
+    candidates: Candidate[],
+  ): Promise<number> {
+    const promoted: number[] = [];
+
+    for (const candidate of candidates) {
+      if (!this.isFollowUpOptedIn(candidate)) continue;
+      if (candidate.followUpStatus !== FOLLOW_UP_NOT_SCHEDULED) continue;
+      // No usable timing means no commitment to make yet; `filterDueFollowUps`
+      // reports the row as unreadable on the same cycle.
+      if (followUpDueAt(candidate) === null) continue;
+
+      await this.googleSheetService.updateRow(candidate.rowNumber, {
+        [SHEET_COLUMNS.FOLLOW_UP_STATUS]: FOLLOW_UP_SCHEDULED,
+      });
+      // Kept in step with the in-memory copy so the same cycle can act on the
+      // row without reading the sheet again.
+      candidate.followUpStatus = FOLLOW_UP_SCHEDULED;
+      promoted.push(candidate.rowNumber);
+    }
+
+    if (promoted.length > 0) {
+      this.logger.log(
+        `Scheduled ${promoted.length} follow-up(s): rows ${promoted.join(', ')}`,
+      );
+    }
+
+    return promoted.length;
+  }
+
+  /**
+   * A follow-up may only go out when the initial email is known to be `SENT`.
+   * Anything else is skipped quietly: it is either not opted in, not a valid
+   * row, or simply not the follow-up's turn yet.
+   */
+  private async filterDueFollowUps(
+    candidates: Candidate[],
+  ): Promise<Candidate[]> {
+    const thresholdMinutes = this.getStaleThresholdMinutes();
+    const now = Date.now();
+    const due: Candidate[] = [];
+    const recovered: number[] = [];
+    const undated: number[] = [];
+    const stuck: number[] = [];
+
+    for (const candidate of candidates) {
+      if (!this.isFollowUpOptedIn(candidate)) continue;
+
+      if (followUpDueAt(candidate) === null) {
+        undated.push(candidate.rowNumber);
+        continue;
+      }
+
+      if (candidate.followUpStatus === FOLLOW_UP_SENT) continue;
+
+      if (candidate.followUpStatus === FOLLOW_UP_FAILED) {
+        // Never resent automatically: the row stays failed until a human puts
+        // it back to SCHEDULED. An unbounded daily retry loop is exactly the
+        // behaviour that gets an outreach domain throttled.
+        stuck.push(candidate.rowNumber);
+        continue;
+      }
+
+      if (candidate.followUpStatus === FOLLOW_UP_PROCESSING) {
+        if (!isStaleFollowUpProcessing(candidate, thresholdMinutes, now)) {
+          continue;
+        }
+        recovered.push(candidate.rowNumber);
+      }
+
+      if (!isFollowUpDue(candidate, now)) continue;
+
+      // A row with a broken email or role is not sendable at all; the follow-up
+      // filter must not be a second, quieter way to mail invalid rows.
+      if ((await validateCandidate(candidate)).length > 0) continue;
+
+      due.push(candidate);
+    }
+
+    if (recovered.length > 0) {
+      this.logger.warn(
+        `Recovering ${recovered.length} stale follow-up PROCESSING row(s): ${recovered.join(', ')}`,
+      );
+    }
+    if (undated.length > 0) {
+      this.logger.warn(
+        `Skipping ${undated.length} follow-up row(s) with an unusable sent_at or follow_up_days: ${undated.join(', ')}`,
+      );
+    }
+    if (stuck.length > 0) {
+      this.logger.warn(
+        `Skipping ${stuck.length} row(s) whose follow-up already FAILED: ${stuck.join(', ')}. ` +
+          'Set follow_up_status back to SCHEDULED to retry.',
+      );
+    }
+
+    return due;
+  }
+
+  /**
+   * A follow-up is only ever considered for a row that opted in *and* whose
+   * initial email is already `SENT`: a follow-up before the first email makes
+   * no sense and would double-contact someone who never got the intro.
+   */
+  private isFollowUpOptedIn(candidate: Candidate): boolean {
+    return candidate.status === SENT && candidate.followUpEnabled === 'YES';
+  }
+
   private acquireRun(): void {
-    if (this.isCampaignRunning) {
+    if (!this.tryAcquireRun()) {
       throw new ConflictException(
         `A campaign is already running${
           this.activeCampaignId ? ` (${this.activeCampaignId})` : ''
         }. Wait for it to finish, or check GET /campaign/status.`,
       );
     }
+  }
+
+  /** Non-throwing acquire: the cron path skips a cycle instead of failing. */
+  private tryAcquireRun(): boolean {
+    if (this.isCampaignRunning) return false;
 
     this.isCampaignRunning = true;
+    return true;
   }
 
   private releaseRun(): void {
     this.isCampaignRunning = false;
     this.activeCampaignId = null;
+  }
+
+  /** Applies the batch cap, and says so loudly when rows are left behind. */
+  private capBatch(
+    eligible: Candidate[],
+    limit: number | undefined,
+    label: string,
+  ): Candidate[] {
+    if (!limit || limit >= eligible.length) return eligible;
+
+    this.logger.warn(
+      `Batch limit ${limit} reached: ${eligible.length} ${label}(s) are due, ` +
+        `${eligible.length - limit} will wait for the next run`,
+    );
+
+    return eligible.slice(0, limit);
+  }
+
+  private buildBatchResult(
+    skipped: BatchRunResult['skipped'],
+    eligible = 0,
+    campaignId: string | null = null,
+  ): BatchRunResult {
+    return {
+      campaignId,
+      eligible,
+      processed: 0,
+      sent: 0,
+      failed: 0,
+      skipped,
+      promoted: 0,
+    };
+  }
+
+  private countResult(result: BatchRunResult, sent: boolean): void {
+    result.processed += 1;
+    if (sent) result.sent += 1;
+    else result.failed += 1;
+  }
+
+  private buildCycleResult(
+    startedAt: string,
+    skipped: DailyCycleResult['skipped'],
+    initial?: BatchRunResult,
+    followUp?: BatchRunResult,
+  ): DailyCycleResult {
+    const empty = this.buildBatchResult(skipped);
+
+    return {
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      skipped,
+      initial: initial ?? empty,
+      followUp: followUp ?? empty,
+      promoted: followUp?.promoted ?? 0,
+    };
   }
 
   /** Total attempts a row may ever make: the first one plus its retries. */
