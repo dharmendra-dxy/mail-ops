@@ -1,6 +1,15 @@
 import { registerAs } from '@nestjs/config';
+import { EMAIL_PROVIDER_OPTIONS } from '../modules/email/email.constant';
 
 export default registerAs('mail', () => ({
+  /**
+   * Selects the `EmailProvider` implementation. V1 ships only `nodemailer`, but
+   * the value is validated at boot so a typo fails loudly instead of silently
+   * leaving the app with no way to send.
+   */
+  provider: (
+    process.env.MAIL_PROVIDER ?? EMAIL_PROVIDER_OPTIONS.NODEMAILER
+  ).toLowerCase(),
   /** Only used as a fallback when MAIL_HOST is empty (nodemailer presets win). */
   service: process.env.MAIL_SERVICE ?? 'gmail',
   host: process.env.MAIL_HOST ?? '',

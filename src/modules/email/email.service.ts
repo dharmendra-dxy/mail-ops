@@ -8,7 +8,13 @@ import {
   SendEmailResult,
 } from './email.types';
 
-/** Single entry point the rest of the app uses to send mail. */
+/**
+ * Single entry point the rest of the app uses to send mail.
+ *
+ * Everything provider-specific — transport, auth, message ids — stays behind
+ * `EmailProvider`, so this class is the only thing the campaign layer depends
+ * on. `CampaignService` never imports a provider.
+ */
 @Injectable()
 export class EmailService {
   constructor(
@@ -20,11 +26,17 @@ export class EmailService {
     return this.provider.send(options);
   }
 
+  /**
+   * Probes the provider's credentials. Its `verify()` is already provider-
+   * specific (SMTP handshake today, an API call for SES), which is why the
+   * abstraction carries it rather than the service guessing.
+   */
   async verify(): Promise<EmailVerificationResult> {
     await this.provider.verify();
 
     return {
       verified: true,
+      provider: this.provider.name,
       host: this.configService.get<string>('mail.host', ''),
       user: this.configService.get<string>('mail.user', ''),
     };

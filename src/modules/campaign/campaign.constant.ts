@@ -63,3 +63,6 @@ export const MILLISECONDS_PER_MINUTE = 60_000;
 export const DEFAULT_EMAIL_DELAY_MS = 2000;
 export const DEFAULT_EMAIL_MAX_RETRIES = 2;
 export const DEFAULT_STALE_PROCESSING_THRESHOLD_MINUTES = 30;
+
+/** How long shutdown waits for the in-flight row before exiting anyway. */
+export const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS = 30_000;

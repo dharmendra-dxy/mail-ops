@@ -4,8 +4,9 @@ What has actually been built, how to run it, and what is deliberately **not** do
 Companion to `prd.md` (what the product should be), `plan.md` (the phases) and
 `../architecture.md` (the code conventions).
 
-**Status: Phases 1–4 complete.** This document covers Phases 1–2; see
-[`guide-2.md`](./guide-2.md) for Phase 3 and [`guide-3.md`](./guide-3.md) for Phase 4.
+**Status: all five phases complete.** This document covers Phases 1–2; see
+[`guide-2.md`](./guide-2.md) for Phase 3, [`guide-3.md`](./guide-3.md) for Phase 4 and
+[`guide-4.md`](./guide-4.md) for Phase 5.
 
 > This guide describes the state of the project after Phase 2. **Phase 3 is now
 > implemented** — see [`guide-2.md`](./guide-2.md) for the campaign state machine,

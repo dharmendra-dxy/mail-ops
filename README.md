@@ -3,11 +3,12 @@
 Personal NestJS backend that automates role-based outreach emails, using a **Google Sheet as the
 only store** — no database.
 
-> **Status: Phases 1–4 complete.** Sheet I/O, validation, role templates, dry-run and real
-> sending, batch orchestration, and the daily cron with follow-ups are all working. Hardening
-> and docs land in Phase 5.
+> **Status: complete (Phases 1–5).** Sheet I/O, validation, role templates, dry-run and real
+> sending, batch orchestration, the daily cron with follow-ups, plus a health endpoint, an API
+> key guard, structured logs and graceful shutdown.
 > Guides: [`guide.md`](src/specs/guide.md) (Phases 1–2), [`guide-2.md`](src/specs/guide-2.md)
-> (Phase 3), [`guide-3.md`](src/specs/guide-3.md) (Phase 4).
+> (Phase 3), [`guide-3.md`](src/specs/guide-3.md) (Phase 4),
+> [`guide-4.md`](src/specs/guide-4.md) (Phase 5).
 
 ## Requirements
 
@@ -104,6 +105,42 @@ sensibly and are written back by later phases. Header matching is case- and sepa
 | `GET /scheduler/status` | Whether a cron job is registered, its schedule, and the last cycle result |
 | `POST /scheduler/run` | Run the daily cycle now: due initial emails, then due follow-ups |
 | `POST /email/verify` | Check the SMTP/OAuth2 credentials before running a campaign |
+| `GET /health` | Reachability of the Sheet and the mail server — `200` up, `503` degraded |
+
+### Health
+
+```bash
+curl -s http://localhost:3000/api/health | jq
+```
+
+```json
+{
+  "status": "up",
+  "checkedAt": "2026-09-27T02:31:04.882Z",
+  "uptimeSeconds": 8134,
+  "checks": [
+    {
+      "name": "googleSheet",
+      "status": "up",
+      "durationMs": 214,
+      "detail": "1 tab(s) reachable, \"Candidates\" present via apps_script"
+    },
+    {
+      "name": "email",
+      "status": "up",
+      "durationMs": 388,
+      "detail": "SMTP credentials accepted for me@gmail.com via smtp.gmail.com"
+    }
+  ]
+}
+```
+
+It probes both dependencies concurrently and never throws: `status` is `up` only when both
+answer, otherwise `degraded` with **503** and the reason on the failing check. A probe that
+hangs is abandoned after `HEALTH_CHECK_TIMEOUT_MS`, and a multi-line provider error is
+collapsed to one line. This is the only endpoint that stays reachable without an API key, so a
+monitor can always ask. The body reports tab names, a driver and a mail host — never a
+credential.
 
 ### Connect a sheet
 
@@ -259,9 +296,11 @@ curl -X POST http://localhost:3000/api/scheduler/run | jq .result.followUp
 ## Email
 
 Sending goes through the `EmailProvider` interface
-(`src/modules/email/providers/email.provider.ts`); nodemailer is the only implementation.
-The campaign layer never talks to nodemailer directly, so adding SES/Resend later is a new
-provider, not a rewrite.
+(`src/modules/email/providers/email.provider.ts`); nodemailer is the only implementation
+(`MAIL_PROVIDER`). `EmailService` is the only thing the campaign layer depends on, so adding
+SES/Resend later is a new class plus one `case` in `email.module.ts` — no change to
+`CampaignService`. An unknown `MAIL_PROVIDER` refuses to boot rather than leaving the app
+unable to send.
 
 Your email copy lives in `src/modules/template/templates/mail-templates.ts` — three roles
 (`FRONTEND`, `BACKEND`, `FULL_STACK`) × two variants (`initial`, `follow_up`), using the
@@ -292,6 +331,58 @@ reuses `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN` with
 curl -X POST http://localhost:3000/api/email/verify
 ```
 
+## API access
+
+Set `API_KEY` and every endpoint except `GET /health` requires it:
+
+```bash
+curl -H 'x-api-key: your-key' http://localhost:3000/api/campaign/status
+curl -H 'Authorization: Bearer your-key' http://localhost:3000/api/campaign/status
+```
+
+```env
+API_KEY_ENABLED=false   # optional; setting API_KEY alone already enables the guard
+API_KEY=
+```
+
+With no key configured the API is open, which is what you want on localhost. The comparison is
+constant-time, and a wrong key gets the same message as a missing one so neither the text nor
+the timing narrows a guess. The guard is registered globally (`APP_GUARD`), so a new controller
+cannot accidentally ship unprotected — a route opts out with `@Public()`, and today only
+`/health` does.
+
+Note the sheet still holds every recipient, so the key protects the API, not the data: the Apps
+Script web app's own "Anyone" access is the wider surface, and it is a trade-off of the
+credential-free driver.
+
+## Shutdown
+
+`Ctrl-C`, `SIGTERM` or a container stop waits for the row currently being sent to finish
+writing to the sheet before the process exits (`SHUTDOWN_DRAIN_TIMEOUT_MS`, default 30s). New
+campaigns are refused with 409 as soon as draining starts. This exists because `POST
+/campaign/send` runs detached — a `PROCESSING` row killed mid-send would otherwise only be
+recovered by stale-`PROCESSING` detection 30 minutes later, and the mail may have gone out
+anyway.
+
+## Logging
+
+Per-candidate lines are structured as `event=<name> key=value …`, so a batch can be followed
+without reading prose:
+
+```text
+event=campaign.started campaignId=campaign-20260927-001 candidates=50 type=initial
+event=candidate.sent row=7 to=hr@globex.com kind=initial campaignId=campaign-20260927-001 attempt=1 maxAttempts=3 messageId=<abc@…>
+event=send.attempt.retrying row=9 to=hr@initech.com kind=initial attempt=1 maxAttempts=3 reason="ETIMEDOUT connection timed out"
+event=candidate.failed row=9 to=hr@initech.com kind=initial attempt=3 maxAttempts=3 reason="503 service unavailable"
+event=campaign.finished campaignId=campaign-20260927-001 sent=48 failed=2
+```
+
+Useful events: `campaign.started|finished|aborted`, `candidate.sent|failed|template_failed`,
+`send.attempt.retrying|permanent_failure|budget_exhausted`, `cycle.started|finished|skipped`,
+`followup.scheduled|recovered_stale|skipped_failed`, `dryrun.rendered`,
+`cron.registered|stopped|disabled`, `shutdown.drain.started|completed|timed_out`. Full rendered
+bodies stay at `debug` level; a 50-row dry run prints 50 subject lines, not 50 emails.
+
 ## Configuration
 
 All environment variables are read once in `src/config`; nothing else touches `process.env`.
@@ -307,6 +398,7 @@ All environment variables are read once in `src/config`; nothing else touches `p
 | `GOOGLE_SHEET_TIMEOUT_MS` | `15000` | Sheet request timeout |
 | `GOOGLE_SPREADSHEET_ID` | – | Default spreadsheet |
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` / `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` | – | service_account driver |
+| `MAIL_PROVIDER` | `nodemailer` | Registered `EmailProvider`; an unknown value refuses to boot |
 | `MAIL_*` | see above | Outgoing mail transport |
 | `SEND_DEFAULT_DRY_RUN` | `true` | Fallback for `POST /campaign/send` when `?dryRun` is absent |
 | `EMAIL_DELAY_MS` | `2000` | Delay between sends |
@@ -317,20 +409,29 @@ All environment variables are read once in `src/config`; nothing else touches `p
 | `CRON_TIMEZONE` | `Asia/Kolkata` | IANA zone the daily run is timed in |
 | `CRON_JOB_NAME` | `mailops-daily-campaign` | Registry key of the job |
 | `CRON_BATCH_LIMIT` | `50` | Cap per run, applied to initial emails and follow-ups separately |
+| `API_KEY` | – | Shared secret required on every endpoint except `/health`; setting it enables the guard |
+| `API_KEY_ENABLED` | derived | Overrides the above; `true` with no key refuses to boot |
+| `HEALTH_CHECK_TIMEOUT_MS` | `10000` | Per-probe timeout in `GET /health` |
+| `SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | How long shutdown waits for the in-flight row |
 
 ## Project layout
 
 ```text
 src/
-├── common/filters/          # global HTTP exception filter
+├── common/
+│   ├── decorators/          # @Public(), the opt-out from the API key guard
+│   ├── filters/             # global HTTP exception filter
+│   ├── guards/              # ApiKeyGuard (registered globally)
+│   └── logger/              # structured `event=… key=value` log formatter
 ├── config/                  # typed, centralised env configuration
 ├── modules/
 │   ├── campaign/            # connect-sheet, validate, preview, status, send
 │   ├── email/               # EmailProvider abstraction + nodemailer provider
 │   ├── google-sheet/        # drivers, repository, service, Candidate entity
+│   ├── health/              # GET /health, sheet + mail probes
 │   ├── scheduler/           # daily cron registration, cycle trigger, status
 │   └── template/            # per-role email copy + Handlebars rendering
-└── specs/                   # PRD, plan, architecture, development guide
+└── specs/                   # PRD, plan, architecture, development guides
 scripts/google-sheet.gs      # Apps Script bridge to deploy
 ```
 

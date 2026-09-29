@@ -18,6 +18,8 @@ export interface SendEmailResult {
 
 export interface EmailVerificationResult {
   verified: boolean;
+  /** The `EmailProvider` that answered, e.g. `nodemailer`. */
+  provider: string;
   host: string;
   user: string;
 }

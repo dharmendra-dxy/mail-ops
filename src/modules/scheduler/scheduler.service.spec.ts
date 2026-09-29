@@ -238,7 +238,13 @@ describe('SchedulerService', () => {
         error: 'sheet unreachable',
       });
       expect(error).toHaveBeenCalledWith(
-        expect.stringContaining('CRON cycle failed: sheet unreachable'),
+        expect.stringContaining('event=scheduler.cycle_failed'),
+      );
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining('trigger=CRON'),
+      );
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining('sheet unreachable'),
       );
       error.mockRestore();
     });
