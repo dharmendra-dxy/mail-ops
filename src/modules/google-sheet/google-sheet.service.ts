@@ -41,6 +41,11 @@ export interface SheetConnectionResult extends SheetConnection {
   active: boolean;
 }
 
+/** What the health check needs to prove the sheet is reachable. */
+export interface SheetConnectivityResult extends SheetConnection {
+  sheetNames: string[];
+}
+
 @Injectable()
 export class GoogleSheetService {
   private readonly logger = new Logger(GoogleSheetService.name);
@@ -122,6 +127,19 @@ export class GoogleSheetService {
     );
 
     return { ...connection, sheetNames, active: true };
+  }
+
+  /**
+   * Cheapest possible reachability probe: lists the tabs without reading a
+   * single data row. Used by the health check, where reading 60 rows to answer
+   * "is the sheet reachable" would cost an extra quota unit for nothing.
+   */
+  async checkConnectivity(
+    connection = this.getConnection(),
+  ): Promise<SheetConnectivityResult> {
+    const sheetNames = await this.repository.listSheetNames(connection);
+
+    return { ...connection, sheetNames };
   }
 
   /** Reads every data row and maps it to a typed `Candidate`. */

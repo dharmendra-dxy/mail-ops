@@ -5,9 +5,10 @@ safely.
 
 Companions: `prd.md` (product), `plan.md` (phases), `architecture.md` (code
 conventions), [`guide.md`](./guide.md) (Phases 1–2) and
-[`guide-2.md`](./guide-2.md) (Phase 3).
+[`guide-2.md`](./guide-2.md) (Phase 3) and [`guide-4.md`](./guide-4.md) (Phase 5).
 
-**Status: Phases 1–4 complete. Phase 5 not started.**
+**Status: all five phases complete.** Phase 5 is in
+[`guide-4.md`](./guide-4.md).
 
 ---
 
@@ -402,21 +403,24 @@ npm run test:e2e  # 14 e2e tests
 | Follow-up attempts are per-run, not in `attempts` | `attempts` is the initial email's budget and must not be overwritten |
 | A cron failure is swallowed, a manual failure is rethrown | An unhandled rejection in a timer callback would kill the process; an HTTP caller should see its own 500 |
 | `promoted` is a separate count from `sent` | "Queued" and "mailed" are different facts, and conflating them hides a stuck row |
-| `GET /campaign/preview?type=follow_up` still filters to `PENDING` rows | Follow-up templates render from the same variables as initial ones, so a `PENDING` row is representative; changing the preview filter to follow-up eligibility is a Phase 5 nicety |
+| `GET /campaign/preview?type=follow_up` still filters to `PENDING` rows | Follow-up templates render from the same variables as initial ones, so a `PENDING` row is representative. Still true in Phase 5: preview shows what a template renders, not what is due |
 
 ---
 
-## 13. Known limitations (carried into Phase 5)
+## 13. Known limitations
 
 - **In-memory lock only.** Two instances would defeat both the run lock and the
   cron. V1 assumes one process; `CRON_JOB_NAME` is the seam to change if that
   ever stops being true.
-- **No graceful drain.** `app.enableShutdownHooks()` stops the cron, but a batch
-  in flight is not drained; an interrupted row relies on stale recovery.
 - **`lastRun` is in memory.** It disappears on restart, which is fine — the sheet
-  is the durable record.
-- **No health endpoint, no API-key guard, no structured per-candidate logging.**
-  Phase 5.
+  is the durable record. `GET /health` reports uptime but no run history, for
+  the same reason.
 - **A cycle that crashes mid-way is not resumable within the same tick.** Rows
   already sent stay sent; rows not yet reached stay `PENDING` and go out on the
   next tick.
+- **The API key protects the API, not the data.** The Apps Script bridge is
+  deployed with "Anyone" access, so the sheet itself is guarded by Google, not
+  by `API_KEY`.
+
+Closed in Phase 5 (see [`guide-4.md`](./guide-4.md)): the missing graceful
+drain, `GET /health`, the API-key guard and structured logging.

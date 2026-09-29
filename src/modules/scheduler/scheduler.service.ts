@@ -7,6 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { CronJob } from 'cron';
 import { SchedulerRegistry } from '@nestjs/schedule';
+import { formatLogEvent } from '../../common/logger/log-event.util';
 import { CampaignService, describeError } from '../campaign';
 import {
   DEFAULT_CRON_BATCH_LIMIT,
@@ -53,8 +54,9 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
     if (!settings.enabled) {
       // Not a warning: leaving cron off is the safe default for local work.
       this.logger.log(
-        'Cron is disabled (CRON_ENABLED=false) — no job registered. ' +
-          'POST /api/scheduler/run still triggers a cycle on demand.',
+        formatLogEvent('cron.disabled', {
+          manualTrigger: 'POST /api/scheduler/run',
+        }),
       );
       return;
     }
@@ -76,9 +78,12 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
     this.job = job;
 
     this.logger.log(
-      `Cron registered: "${settings.expression}" (${settings.timezone}) as ` +
-        `"${settings.jobName}", batch limit ${settings.batchLimit}. ` +
-        'Next tick runs initial emails, then follow-ups.',
+      formatLogEvent('cron.registered', {
+        jobName: settings.jobName,
+        expression: settings.expression,
+        timezone: settings.timezone,
+        batchLimit: settings.batchLimit,
+      }),
     );
   }
 
@@ -95,6 +100,8 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
     if (this.schedulerRegistry.doesExist('cron', jobName)) {
       this.schedulerRegistry.deleteCronJob(jobName);
     }
+
+    this.logger.log(formatLogEvent('cron.stopped', { jobName }));
   }
 
   getStatus(): SchedulerStatus {
@@ -136,9 +143,14 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
       this.lastRunAt = new Date().toISOString();
 
       this.logger.log(
-        `${trigger} cycle ${result.skipped ?? 'completed'}: ` +
-          `initial ${result.initial.sent}/${result.initial.eligible} sent, ` +
-          `follow-ups ${result.followUp.sent}/${result.followUp.eligible} sent`,
+        formatLogEvent('scheduler.cycle', {
+          trigger,
+          outcome: result.skipped ?? 'completed',
+          initialSent: result.initial.sent,
+          initialEligible: result.initial.eligible,
+          followUpSent: result.followUp.sent,
+          followUpEligible: result.followUp.eligible,
+        }),
       );
 
       return { trigger, result, skipped: result.skipped, error: null };
@@ -149,7 +161,12 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
       // because there the HTTP caller should see the error.
       this.lastError = describeError(error);
       this.lastErrorAt = new Date().toISOString();
-      this.logger.error(`${trigger} cycle failed: ${this.lastError}`);
+      this.logger.error(
+        formatLogEvent('scheduler.cycle_failed', {
+          trigger,
+          reason: this.lastError,
+        }),
+      );
 
       if (trigger === 'MANUAL') throw error;
 

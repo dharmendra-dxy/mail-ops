@@ -7,8 +7,9 @@ Companions: `prd.md` (product), `plan.md` (phases), `architecture.md` (code
 conventions) and [`guide.md`](./guide.md) (Phase 1–2 background). This document
 supersedes the "What Phase 3 will add (not built yet)" section of `guide.md`.
 
-**Status: Phases 1–4 complete.** This document covers Phase 3; see
-[`guide-3.md`](./guide-3.md) for Phase 4 (cron + follow-ups) and what remains in Phase 5.
+**Status: all five phases complete.** This document covers Phase 3; see
+[`guide-3.md`](./guide-3.md) for Phase 4 (cron + follow-ups) and
+[`guide-4.md`](./guide-4.md) for Phase 5 (hardening).
 
 ---
 
@@ -330,14 +331,17 @@ manually resolved promise and poll `GET /campaign/status`.
 
 ---
 
-## 14. Still not built (Phase 5)
+## 14. Built in Phase 5
 
-Do not rely on any of this yet:
+Everything Phase 5 added sits on top of this layer and is documented in
+[`guide-4.md`](./guide-4.md):
 
-- **Graceful shutdown.** `app.enableShutdownHooks()` is on, but a batch in
-  flight is not drained — an interrupted row relies on stale recovery.
-- **`GET /health`**, API-key guard, structured per-candidate logging, and the
-  README polish that Phase 5 calls for.
+- **Graceful shutdown** — `CampaignService.onApplicationShutdown` drains the
+  detached batch, so an interrupted row is no longer the normal case.
+- **`GET /health`**, the API-key guard, structured per-candidate logging, and
+  the README.
+
+The batch semantics described above are unchanged.
 
 Cron, the daily cycle and follow-ups all shipped in Phase 4 — see
 [`guide-3.md`](./guide-3.md).

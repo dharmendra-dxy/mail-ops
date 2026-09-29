@@ -1,6 +1,12 @@
-import { ConflictException, Injectable, Logger } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  OnApplicationShutdown,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { validate, ValidationError } from 'class-validator';
+import { formatLogEvent } from '../../common/logger/log-event.util';
 import { EmailService } from '../email';
 import {
   Candidate,
@@ -20,6 +26,7 @@ import {
   CAMPAIGN_RUN_STATUS,
   DEFAULT_EMAIL_DELAY_MS,
   DEFAULT_EMAIL_MAX_RETRIES,
+  DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS,
   DEFAULT_STALE_PROCESSING_THRESHOLD_MINUTES,
   ERROR_CLASSIFICATION,
   FAILED,
@@ -75,7 +82,7 @@ type SendOutcome =
   | { ok: false; reason: string; attempts: number };
 
 @Injectable()
-export class CampaignService {
+export class CampaignService implements OnApplicationShutdown {
   private readonly logger = new Logger(CampaignService.name);
 
   /**
@@ -84,6 +91,15 @@ export class CampaignService {
    */
   private isCampaignRunning = false;
   private activeCampaignId: string | null = null;
+
+  /**
+   * The in-flight run, kept so shutdown can wait for it. `spawnRun` is
+   * deliberately detached (a 50-row batch must not hold the HTTP request open),
+   * which is exactly why an un-awaited batch would otherwise be killed
+   * mid-send on SIGTERM.
+   */
+  private activeRun: Promise<void> | null = null;
+  private isDraining = false;
 
   constructor(
     private readonly googleSheetService: GoogleSheetService,
@@ -178,6 +194,14 @@ export class CampaignService {
    * request open for `limit * EMAIL_DELAY_MS` and time out.
    */
   async send(dto: SendCampaignDto): Promise<CampaignRunResponse> {
+    if (this.isDraining) {
+      // Shutting down. Refusing here is better than accepting a run that would
+      // be killed before it settled, which is a row left in PROCESSING.
+      throw new ConflictException(
+        'The app is shutting down and is not accepting new campaigns. Try again once it is back.',
+      );
+    }
+
     this.acquireRun();
 
     try {
@@ -199,8 +223,11 @@ export class CampaignService {
     if (allEligible.length > eligible.length) {
       // Never let a cap look like "that was everything".
       this.logger.warn(
-        `Limit ${dto.limit} reached: ${allEligible.length} rows are eligible, ` +
-          `${allEligible.length - eligible.length} were not processed`,
+        formatLogEvent('campaign.limit_reached', {
+          limit: dto.limit,
+          eligible: allEligible.length,
+          deferred: allEligible.length - eligible.length,
+        }),
       );
     }
 
@@ -229,10 +256,11 @@ export class CampaignService {
     this.activeCampaignId = campaignId;
 
     // Ownership of the lock moves to the background run, which releases it.
-    void this.spawnRun(
+    this.activeRun = this.spawnRun(
       { role: dto.role, type: dto.type },
       { campaignId, eligible },
     );
+    void this.activeRun;
 
     return {
       connection,
@@ -259,10 +287,80 @@ export class CampaignService {
       // Stamping the batch can fail before the row loop starts; without this
       // the run would silently keep the lock forever.
       this.logger.error(
-        `Campaign ${preset.campaignId} aborted before sending: ${describeError(error)}`,
+        formatLogEvent('campaign.aborted_before_sending', {
+          campaignId: preset.campaignId,
+          reason: describeError(error),
+        }),
       );
     } finally {
       this.releaseRun();
+      this.activeRun = null;
+    }
+  }
+
+  /**
+   * Waits for the detached batch to settle before the process exits.
+   *
+   * Without this a `Ctrl-C` or a deploy during a batch kills the process between
+   * `PROCESSING` being written and `SENT`, so the row is only recoverable
+   * through stale-`PROCESSING` recovery 30 minutes later. Draining turns a
+   * normal restart into a clean stop; the timeout exists only so a hung
+   * provider cannot block shutdown forever.
+   */
+  async onApplicationShutdown(signal?: string): Promise<void> {
+    this.isDraining = true;
+
+    const run = this.activeRun;
+    if (!run) return;
+
+    const timeoutMs =
+      this.configService.get<number>('campaign.shutdownDrainTimeoutMs') ??
+      DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS;
+
+    this.logger.log(
+      formatLogEvent('shutdown.drain.started', {
+        signal: signal ?? 'unknown',
+        campaignId: this.activeCampaignId,
+        timeoutMs,
+      }),
+    );
+
+    const drained = await this.waitFor(run, timeoutMs);
+
+    this.logger.log(
+      drained
+        ? formatLogEvent('shutdown.drain.completed', {
+            campaignId: this.activeCampaignId,
+          })
+        : formatLogEvent('shutdown.drain.timed_out', {
+            campaignId: this.activeCampaignId,
+            timeoutMs,
+            note: 'an in-flight row stays PROCESSING and is recovered by stale-processing detection',
+          }),
+    );
+  }
+
+  /** Resolves false when the run outlives the timeout, without rejecting. */
+  private async waitFor(
+    run: Promise<void>,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([
+        run.then(
+          () => true,
+          () => true, // A failed run is still settled; there is nothing to wait for.
+        ),
+        timeout,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -278,16 +376,20 @@ export class CampaignService {
 
     if (!this.tryAcquireRun()) {
       this.logger.warn(
-        `Scheduled cycle skipped${
-          this.activeCampaignId ? ` (${this.activeCampaignId} is running)` : ''
-        }. Check GET /campaign/status.`,
+        formatLogEvent('cycle.skipped', {
+          reason: SKIP_REASON.RUN_IN_PROGRESS,
+          activeCampaignId: this.activeCampaignId,
+        }),
       );
 
       return this.buildCycleResult(startedAt, SKIP_REASON.RUN_IN_PROGRESS);
     }
 
     this.logger.log(
-      'Scheduled cycle started (initial emails, then follow-ups)',
+      formatLogEvent('cycle.started', {
+        limit: options.limit,
+        role: options.role,
+      }),
     );
 
     try {
@@ -296,8 +398,15 @@ export class CampaignService {
 
       const result = this.buildCycleResult(startedAt, null, initial, followUp);
       this.logger.log(
-        `Scheduled cycle finished: initial sent=${initial.sent} failed=${initial.failed}, ` +
-          `follow-ups sent=${followUp.sent} failed=${followUp.failed}, promoted=${result.promoted}`,
+        formatLogEvent('cycle.finished', {
+          initialSent: initial.sent,
+          initialFailed: initial.failed,
+          followUpSent: followUp.sent,
+          followUpFailed: followUp.failed,
+          promoted: result.promoted,
+          durationMs:
+            Date.parse(result.finishedAt) - Date.parse(result.startedAt),
+        }),
       );
 
       return result;
@@ -316,7 +425,10 @@ export class CampaignService {
   ): Promise<BatchRunResult> {
     if (!this.tryAcquireRun()) {
       this.logger.warn(
-        'Initial-email batch skipped: a run is already in progress',
+        formatLogEvent('batch.skipped', {
+          kind: 'initial',
+          reason: SKIP_REASON.RUN_IN_PROGRESS,
+        }),
       );
       return this.buildBatchResult(SKIP_REASON.RUN_IN_PROGRESS);
     }
@@ -337,7 +449,12 @@ export class CampaignService {
     options: ScheduledRunOptions = {},
   ): Promise<BatchRunResult> {
     if (!this.tryAcquireRun()) {
-      this.logger.warn('Follow-up batch skipped: a run is already in progress');
+      this.logger.warn(
+        formatLogEvent('batch.skipped', {
+          kind: 'follow-up',
+          reason: SKIP_REASON.RUN_IN_PROGRESS,
+        }),
+      );
       return this.buildBatchResult(SKIP_REASON.RUN_IN_PROGRESS);
     }
 
@@ -356,14 +473,18 @@ export class CampaignService {
     const batch = preset ?? (await this.resolveInitialBatch(options));
 
     if (batch.eligible.length === 0) {
-      this.logger.debug('No initial emails are due');
+      this.logger.debug(formatLogEvent('batch.empty', { kind: 'initial' }));
       return this.buildBatchResult(null, 0);
     }
 
     this.activeCampaignId = batch.campaignId;
     this.logger.log(
-      `Campaign ${batch.campaignId} started for ${batch.eligible.length} candidate(s)` +
-        `${options.role ? ` (role=${options.role})` : ''}`,
+      formatLogEvent('campaign.started', {
+        campaignId: batch.campaignId,
+        candidates: batch.eligible.length,
+        role: options.role,
+        type: options.type ?? TEMPLATE_TYPES.INITIAL,
+      }),
     );
 
     return this.executeCampaign(
@@ -404,7 +525,7 @@ export class CampaignService {
     const eligible = this.capBatch(due, options.limit, 'follow-up');
 
     if (eligible.length === 0) {
-      this.logger.debug('No follow-ups are due');
+      this.logger.debug(formatLogEvent('batch.empty', { kind: 'follow-up' }));
       return { ...this.buildBatchResult(null, 0), promoted };
     }
 
@@ -415,7 +536,11 @@ export class CampaignService {
     this.activeCampaignId = campaignId;
 
     this.logger.log(
-      `Follow-up campaign ${campaignId} started for ${eligible.length} row(s)`,
+      formatLogEvent('followup.started', {
+        campaignId,
+        rows: eligible.length,
+        promoted,
+      }),
     );
 
     return {
@@ -434,7 +559,12 @@ export class CampaignService {
     this.activeCampaignId = campaignId;
 
     try {
-      this.logger.log(`[dry-run] rendering ${eligible.length} candidate(s)`);
+      this.logger.log(
+        formatLogEvent('dryrun.started', {
+          candidates: eligible.length,
+          type,
+        }),
+      );
 
       const results = eligible.map((candidate) =>
         this.renderOnly(candidate, type),
@@ -479,12 +609,21 @@ export class CampaignService {
         }
       }
 
-      this.logger.log(`Campaign ${campaignId} finished`);
+      this.logger.log(
+        formatLogEvent('campaign.finished', {
+          campaignId,
+          sent: result.sent,
+          failed: result.failed,
+        }),
+      );
     } catch (error) {
       // Per-row failures are already handled, so this only fires if the loop
       // itself breaks; the rows already sent stay sent either way.
       this.logger.error(
-        `Campaign ${campaignId} aborted: ${describeError(error)}`,
+        formatLogEvent('campaign.aborted', {
+          campaignId,
+          reason: describeError(error),
+        }),
       );
     }
 
@@ -508,10 +647,19 @@ export class CampaignService {
         }
       }
 
-      this.logger.log(`Follow-up campaign ${campaignId} finished`);
+      this.logger.log(
+        formatLogEvent('followup.finished', {
+          campaignId,
+          sent: result.sent,
+          failed: result.failed,
+        }),
+      );
     } catch (error) {
       this.logger.error(
-        `Follow-up campaign ${campaignId} aborted: ${describeError(error)}`,
+        formatLogEvent('followup.aborted', {
+          campaignId,
+          reason: describeError(error),
+        }),
       );
     }
 
@@ -544,7 +692,12 @@ export class CampaignService {
         candidate.attempts + 1,
       );
       this.logger.error(
-        `Row ${rowNumber} template failed for ${email}: ${reason}`,
+        formatLogEvent('candidate.template_failed', {
+          row: rowNumber,
+          to: email,
+          kind: 'initial',
+          reason,
+        }),
       );
       return false;
     }
@@ -570,7 +723,15 @@ export class CampaignService {
         outcome.attempts,
       );
       this.logger.error(
-        `Row ${rowNumber} FAILED to=${email} after ${outcome.attempts} attempt(s): ${outcome.reason}`,
+        formatLogEvent('candidate.failed', {
+          row: rowNumber,
+          to: email,
+          kind: 'initial',
+          campaignId,
+          attempt: outcome.attempts,
+          maxAttempts,
+          reason: outcome.reason,
+        }),
       );
       return false;
     }
@@ -587,7 +748,16 @@ export class CampaignService {
     });
 
     this.logger.log(
-      `Row ${rowNumber} SENT to=${email} attempts=${outcome.attempts}/${maxAttempts} messageId=${outcome.messageId}`,
+      formatLogEvent('candidate.sent', {
+        row: rowNumber,
+        to: email,
+        company: candidate.company,
+        role: candidate.role,
+        campaignId,
+        attempt: outcome.attempts,
+        maxAttempts,
+        messageId: outcome.messageId,
+      }),
     );
     return true;
   }
@@ -610,7 +780,12 @@ export class CampaignService {
       const reason = describeError(error);
       await this.markFollowUpFailed(candidate, campaignId, reason);
       this.logger.error(
-        `Row ${rowNumber} follow-up template failed for ${email}: ${reason}`,
+        formatLogEvent('candidate.template_failed', {
+          row: rowNumber,
+          to: email,
+          kind: 'follow-up',
+          reason,
+        }),
       );
       return false;
     }
@@ -633,7 +808,14 @@ export class CampaignService {
     if (!outcome.ok) {
       await this.markFollowUpFailed(candidate, campaignId, outcome.reason);
       this.logger.error(
-        `Row ${rowNumber} follow-up FAILED to=${email} after ${outcome.attempts} attempt(s): ${outcome.reason}`,
+        formatLogEvent('candidate.failed', {
+          row: rowNumber,
+          to: email,
+          kind: 'follow-up',
+          campaignId,
+          attempt: outcome.attempts,
+          reason: outcome.reason,
+        }),
       );
       return false;
     }
@@ -646,7 +828,14 @@ export class CampaignService {
     });
 
     this.logger.log(
-      `Row ${rowNumber} follow-up SENT to=${email} attempts=${outcome.attempts} messageId=${outcome.messageId}`,
+      formatLogEvent('candidate.sent', {
+        row: rowNumber,
+        to: email,
+        kind: 'follow-up',
+        campaignId,
+        attempt: outcome.attempts,
+        messageId: outcome.messageId,
+      }),
     );
     return true;
   }
@@ -689,22 +878,31 @@ export class CampaignService {
         const isRetryable =
           classifyEmailError(error) === ERROR_CLASSIFICATION.RETRYABLE;
 
+        const attemptFields = {
+          row: rowNumber,
+          to: email,
+          kind,
+          attempt: attempts,
+          maxAttempts,
+          reason: describeError(error),
+        };
+
         if (!isRetryable) {
           this.logger.warn(
-            `Row ${rowNumber} ${kind} attempt ${attempts}/${maxAttempts} failed permanently: ${describeError(error)}`,
+            formatLogEvent('send.attempt.permanent_failure', attemptFields),
           );
           break;
         }
 
         if (attempts >= maxAttempts) {
           this.logger.warn(
-            `Row ${rowNumber} ${kind} attempt ${attempts}/${maxAttempts} failed retryably, retry budget exhausted: ${describeError(error)}`,
+            formatLogEvent('send.attempt.budget_exhausted', attemptFields),
           );
           break;
         }
 
         this.logger.warn(
-          `Row ${rowNumber} ${kind} attempt ${attempts}/${maxAttempts} failed retryably, retrying: ${describeError(error)}`,
+          formatLogEvent('send.attempt.retrying', attemptFields),
         );
         await this.delayBetweenSends();
       }
@@ -778,10 +976,20 @@ export class CampaignService {
     };
 
     this.logger.log(
-      `[dry-run] row=${candidate.rowNumber} to=${candidate.email} subject="${rendered.subject}"`,
+      formatLogEvent('dryrun.rendered', {
+        row: candidate.rowNumber,
+        to: candidate.email,
+        role: candidate.role,
+        subject: rendered.subject,
+      }),
     );
+    // The body is only useful at `debug`, where the operator opted in: at
+    // `log` level a 50-row dry run would print 50 full emails.
     this.logger.debug(
-      `[dry-run] row=${candidate.rowNumber} body:\n${rendered.body}`,
+      formatLogEvent('dryrun.body', {
+        row: candidate.rowNumber,
+        body: rendered.body,
+      }),
     );
 
     return result;
@@ -853,13 +1061,21 @@ export class CampaignService {
     // that would otherwise go unnoticed for weeks.
     if (recovered.length > 0) {
       this.logger.warn(
-        `Recovering ${recovered.length} stale PROCESSING row(s): ${recovered.join(', ')}`,
+        formatLogEvent('batch.recovered_stale', {
+          count: recovered.length,
+          rows: recovered.join(','),
+          thresholdMinutes,
+        }),
       );
     }
     if (exhausted.length > 0) {
       this.logger.warn(
-        `Skipping ${exhausted.length} row(s) that already used all ${maxAttempts} attempts: ` +
-          `${exhausted.join(', ')}. Reset them to PENDING to retry.`,
+        formatLogEvent('batch.skipped_exhausted', {
+          count: exhausted.length,
+          rows: exhausted.join(','),
+          maxAttempts,
+          reason: 'reset them to PENDING to retry',
+        }),
       );
     }
 
@@ -895,7 +1111,10 @@ export class CampaignService {
 
     if (promoted.length > 0) {
       this.logger.log(
-        `Scheduled ${promoted.length} follow-up(s): rows ${promoted.join(', ')}`,
+        formatLogEvent('followup.scheduled', {
+          count: promoted.length,
+          rows: promoted.join(','),
+        }),
       );
     }
 
@@ -953,18 +1172,28 @@ export class CampaignService {
 
     if (recovered.length > 0) {
       this.logger.warn(
-        `Recovering ${recovered.length} stale follow-up PROCESSING row(s): ${recovered.join(', ')}`,
+        formatLogEvent('followup.recovered_stale', {
+          count: recovered.length,
+          rows: recovered.join(','),
+        }),
       );
     }
     if (undated.length > 0) {
       this.logger.warn(
-        `Skipping ${undated.length} follow-up row(s) with an unusable sent_at or follow_up_days: ${undated.join(', ')}`,
+        formatLogEvent('followup.skipped_undated', {
+          count: undated.length,
+          rows: undated.join(','),
+          reason: 'unusable sent_at or follow_up_days',
+        }),
       );
     }
     if (stuck.length > 0) {
       this.logger.warn(
-        `Skipping ${stuck.length} row(s) whose follow-up already FAILED: ${stuck.join(', ')}. ` +
-          'Set follow_up_status back to SCHEDULED to retry.',
+        formatLogEvent('followup.skipped_failed', {
+          count: stuck.length,
+          rows: stuck.join(','),
+          reason: 'set follow_up_status back to SCHEDULED to retry',
+        }),
       );
     }
 
@@ -1012,8 +1241,12 @@ export class CampaignService {
     if (!limit || limit >= eligible.length) return eligible;
 
     this.logger.warn(
-      `Batch limit ${limit} reached: ${eligible.length} ${label}(s) are due, ` +
-        `${eligible.length - limit} will wait for the next run`,
+      formatLogEvent('campaign.batch_limit_reached', {
+        label,
+        limit,
+        due: eligible.length,
+        deferred: eligible.length - limit,
+      }),
     );
 
     return eligible.slice(0, limit);

@@ -407,7 +407,10 @@ describe('CampaignService', () => {
       expect(response.eligible).toBe(3);
       expect(response.processed).toBe(2);
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining('3 rows are eligible'),
+        expect.stringContaining('event=campaign.limit_reached'),
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('eligible=3 deferred=1'),
       );
       warn.mockRestore();
     });
@@ -711,7 +714,10 @@ describe('CampaignService', () => {
       expect(started.total).toBe(0);
       expect(emailService.send).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining('already used all 3 attempts'),
+        expect.stringContaining('event=batch.skipped_exhausted'),
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('maxAttempts=3'),
       );
       warn.mockRestore();
     });
@@ -767,8 +773,9 @@ describe('CampaignService', () => {
       expect(started.total).toBe(1);
       expect(emailService.send).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining('stale PROCESSING row(s): 2'),
+        expect.stringContaining('event=batch.recovered_stale'),
       );
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('rows=2'));
       warn.mockRestore();
     });
 
@@ -952,7 +959,7 @@ describe('CampaignService', () => {
       expect(result.eligible).toBe(0);
       expect(emailService.send).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining('follow-up already FAILED'),
+        expect.stringContaining('event=followup.skipped_failed'),
       );
       warn.mockRestore();
     });
@@ -997,8 +1004,9 @@ describe('CampaignService', () => {
       expect(result.eligible).toBe(0);
       expect(emailService.send).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining('unusable sent_at or follow_up_days: 2, 3'),
+        expect.stringContaining('event=followup.skipped_undated'),
       );
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('rows=2,3'));
       warn.mockRestore();
     });
 
@@ -1229,6 +1237,68 @@ describe('CampaignService', () => {
     expect(googleSheetService.connect).toHaveBeenCalledWith({
       spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${CONNECTION.spreadsheetId}/edit`,
       sheetName: undefined,
+    });
+  });
+
+  describe('graceful shutdown', () => {
+    it('waits for the in-flight row to settle before the process exits', async () => {
+      const gate = deferred();
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+      ]);
+      emailService.send.mockReturnValue(gate.promise);
+
+      // Awaited only to be sure the detached run has been registered; the batch
+      // itself is still parked inside the provider call.
+      await service.send(
+        Object.assign(new SendCampaignDto(), { dryRun: false }),
+      );
+
+      const drain = service.onApplicationShutdown('SIGTERM');
+      // Released after the drain started: the run must still be awaited, or the
+      // row would be left PROCESSING until stale recovery 30 minutes later.
+      gate.resolve({ messageId: 'msg-1' });
+      await drain;
+      await waitForIdle();
+
+      expect(googleSheetService.updateRow).toHaveBeenCalledWith(
+        2,
+        expect.objectContaining({ status: 'SENT', message_id: 'msg-1' }),
+      );
+    });
+
+    it('resolves immediately when no run is in flight', async () => {
+      await expect(
+        service.onApplicationShutdown('SIGTERM'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('gives up after the drain timeout rather than blocking shutdown forever', async () => {
+      configValues['campaign.shutdownDrainTimeoutMs'] = 10;
+      jest.useFakeTimers();
+      googleSheetService.getCandidates.mockResolvedValue([
+        buildCandidate({ rowNumber: 2 }),
+      ]);
+      emailService.send.mockReturnValue(new Promise(() => undefined));
+
+      void service.send(
+        Object.assign(new SendCampaignDto(), { dryRun: false }),
+      );
+
+      const drain = service.onApplicationShutdown('SIGTERM');
+      await jest.advanceTimersByTimeAsync(10);
+      await expect(drain).resolves.toBeUndefined();
+
+      jest.useRealTimers();
+    });
+
+    it('refuses a new campaign once it is draining', async () => {
+      await service.onApplicationShutdown('SIGTERM');
+
+      await expect(
+        service.send(Object.assign(new SendCampaignDto(), { dryRun: false })),
+      ).rejects.toThrow(/shutting down/);
+      expect(emailService.send).not.toHaveBeenCalled();
     });
   });
 });
